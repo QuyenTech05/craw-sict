@@ -314,6 +314,67 @@ async def _test_new_posts_drain_before_recheck_with_one_deadline(monkeypatch):
     calls.clear()
     await I.run_incremental(check_edits=5, crawl_limit=5, annotate_ocr=0, budget_sec=0)
     assert seen["drain"] is None and seen["recheck"] is None              # 0 = không giới hạn
+    calls.clear()
+    await I.run_incremental(check_edits=5, crawl_limit=5, annotate_ocr=0, budget_sec=300, graph=False)
+    assert "graph" not in calls and calls[-1] == "reconcile"               # --skip-graph: bỏ stage graph
+
+
+class _SigRedis:
+    """Đủ get/set cho stage graph (`graph:corpus_sig`)."""
+
+    def __init__(self):
+        self.store = {}
+
+    def get(self, k):
+        return self.store.get(k)
+
+    def set(self, k, v):
+        self.store[k] = v
+
+
+def test_equal_signature_skips_rebuild(monkeypatch):
+    """Chữ ký trùng chữ ký lần dựng cuối → bỏ qua (cron 12h/lần không rebuild vô ích)."""
+    monkeypatch.setattr(I.vector_store, "has_sparse", lambda: True)
+
+    async def sig():
+        return "s1"
+    monkeypatch.setattr(I, "corpus_signature", sig)
+    r = _SigRedis()
+    r.store["graph:corpus_sig"] = "s1"
+    monkeypatch.setattr(I, "_redis", lambda: r)
+    from sict_crawler.service.graph import graphsync
+    monkeypatch.setattr(graphsync, "rebuild", lambda s: (_ for _ in ()).throw(AssertionError("không được rebuild")))
+    assert asyncio.run(I.run_graph_stage()) == {"skipped": "corpus không đổi"}
+
+
+def test_changed_signature_rebuilds_and_stores_sig(monkeypatch):
+    """Corpus đổi → rebuild rồi ghi chữ ký mới vào Redis (signature sau rebuild = chữ ký vừa đọc)."""
+    monkeypatch.setattr(I.vector_store, "has_sparse", lambda: True)
+    seen = {"sigs": []}
+
+    async def sig():
+        seen["sigs"].append("call")
+        return "s2"
+    monkeypatch.setattr(I, "corpus_signature", sig)
+    r = _SigRedis()
+    r.store["graph:corpus_sig"] = "s1"
+    monkeypatch.setattr(I, "_redis", lambda: r)
+    rebuilt = []
+
+    async def rebuild(session):
+        rebuilt.append(1)
+        return {"ok": 1}
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+    from sict_crawler.service.graph import graphsync
+    monkeypatch.setattr(graphsync, "rebuild", rebuild)
+    monkeypatch.setattr(I.db, "get_session", lambda: _FakeSession())
+    assert asyncio.run(I.run_graph_stage()) == {"rebuild": {"ok": 1}} and rebuilt == [1]
+    assert r.store["graph:corpus_sig"] == "s2"                              # chữ ký đã ghi sau khi dựng
 
 
 def test_wait_for_services_retries_until_up():

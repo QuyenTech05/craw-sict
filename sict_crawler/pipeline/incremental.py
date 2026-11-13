@@ -427,6 +427,18 @@ async def _graph_stage() -> dict | None:
     return {"rebuild": stats}
 
 
+async def run_graph_stage() -> dict | None:
+    """Entry cho `main.py --graph-only`: dựng graph ngay sau lượt incremental đã chạy với `--skip-graph`
+    (VM2 512 MB, 2026-11-13: đỉnh RAM của worker 969 MiB rơi đúng cửa sổ rebuild — tách ra để lượt crawl
+    không bị OOM giữa đường). Vẫn kiểm chữ ký corpus nên corpus không đổi → bỏ qua, không rebuild 12h/lần."""
+    try:
+        return await _graph_stage()
+    except Exception as e:
+        print(f"[incremental/graph] error: {e}")
+        _heartbeat(False, {"stage_errors": [f"graph: {e}"]})
+        raise
+
+
 async def _maybe_reconcile() -> dict | None:
     """Đối soát PG ↔ Qdrant (reconcile.py) tối đa 1 lần / 20h — khoá Redis `reconcile:last`.
     Collection v1 → bỏ qua."""
@@ -439,14 +451,17 @@ async def _maybe_reconcile() -> dict | None:
 
 
 async def run_incremental(check_edits: int = 50, crawl_limit: int = 200,
-                          annotate_ocr: int = 500, budget_sec: int | None = None) -> dict:
+                          annotate_ocr: int = 500, budget_sec: int | None = None,
+                          graph: bool = True) -> dict:
     """Entry cho cron: discover → listings → drain → recheck → graph → reconcile → annotate-ocr.
 
     Mỗi stage cách ly lỗi: stage fail ghi errors + notify nhưng các stage
     còn lại vẫn chạy, cuối chu kỳ luôn heartbeat + summary. `budget_sec` (mặc định
     `crawl.cycle_budget_sec`, 0 = không giới hạn) tính từ lúc các store đã sẵn sàng, áp cho drain và
     recheck. Store không lên kịp / khởi tạo lỗi → bỏ lượt, ghi heartbeat lỗi.
-    """
+
+    `graph=False` (CLI `--skip-graph`) bỏ stage graph khỏi lượt: worker RAM nhỏ chạy graph riêng ngay sau
+    lượt bằng `main.py --graph-only` (đỉnh 969 MiB của rebuild không nằm chung peak với crawl)."""
     from sict_crawler.core.config import get_settings
     from sict_crawler.service.index.annotate_ocr import run_annotate_ocr
 
@@ -486,10 +501,11 @@ async def run_incremental(check_edits: int = 50, crawl_limit: int = 200,
         summary.update(await recheck_edits(check_edits, deadline) if check_edits > 0 else {})
     except Exception as e:
         summary["stage_errors"].append(f"recheck: {e}")
-    try:
-        summary["graph"] = await _graph_stage()
-    except Exception as e:
-        summary["stage_errors"].append(f"graph: {e}")
+    if graph:
+        try:
+            summary["graph"] = await _graph_stage()
+        except Exception as e:
+            summary["stage_errors"].append(f"graph: {e}")
     try:
         summary["reconcile"] = await _maybe_reconcile()
     except Exception as e:

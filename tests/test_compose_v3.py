@@ -135,6 +135,7 @@ def _compose_available() -> bool:
     ["docker-compose.yml", "docker-compose.worker.yml"],
     ["docker-compose.yml", "docker-compose.worker.yml", "docker-compose.embed.yml"],
     ["docker-compose.worker.yml", "docker-compose.embed.yml"],                       # VM2
+    ["docker-compose.worker-lite.yml"],                                                # worker 512 MB
 ])
 def test_compose_config_renders_without_env(files):
     """Chỉ render (`config`), không up; .env vắng mặt (required: false) vẫn phải render được."""
@@ -148,3 +149,27 @@ def test_compose_config_renders_without_env(files):
         rendered = yaml.safe_load(r.stdout)["services"]["cron"]["environment"]
         assert rendered["EMBED_API_BASE"] == "http://embed:8090/v1"
         assert rendered["EMBED_BACKEND"] == "" and rendered["QDRANT_COLLECTION_TEXT"] == ""
+
+
+def test_worker_lite_fits_512mb():
+    """Máy worker 512 MB (2026-11-13): không Obscura (httpx), graph dựng riêng sau lượt, mem_limit ≤ 512m.
+    Số đo trial-24h: worker < 200 MiB ở 99,7% mẫu; đỉnh 969 MiB là cửa sổ graph rebuild."""
+    svcs = _services("docker-compose.worker-lite.yml")
+    assert list(svcs) == ["cron"], "worker-lite chỉ có cron (không Obscura, không svc-ocr)"
+    cron = svcs["cron"]
+    assert cron["mem_limit"] == "${CRON_MEM_LIMIT:-512m}"
+    assert cron["environment"]["CRAWLER_BACKEND"] == "${CRAWLER_BACKEND:-httpx}"
+    cmd = cron["command"]
+    assert "--skip-graph" in cmd and "--graph-only" in cmd
+    assert cmd.index("--graph-only") < cmd.index("sleep")      # graph chạy NGAY SAU lượt, trước khi ngủ 12h
+    for k in V3_VARS:
+        assert k in cron["environment"], f"worker-lite thiếu {k}"
+
+
+def test_graph_only_cli_flags_exist():
+    """main.py phải có cờ --skip-graph / --graph-only (worker-lite gọi chúng trong vòng lặp cron)."""
+    from sict_crawler.pipeline import main as M
+    import inspect
+    src = inspect.getsource(M.main)
+    assert '"--skip-graph"' in src and '"--graph-only"' in src
+    assert "run_graph_stage" in src

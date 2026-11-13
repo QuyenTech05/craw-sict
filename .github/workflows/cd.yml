@@ -8,6 +8,8 @@ name: CD
 # để phải duyệt trước khi chạy — bật qua UI, trigger push vẫn tôn trọng reviewers).
 # Secrets: VM1_HOST, VM1_KEY, VM2_HOST, VM2_KEY (đã có); alloy thêm GCLOUD_HOSTED_METRICS_URL, GCLOUD_HOSTED_METRICS_ID,
 #   GCLOUD_SCRAPE_INTERVAL, GCLOUD_HOSTED_LOGS_URL, GCLOUD_HOSTED_LOGS_ID, GCLOUD_RW_API_KEY.
+# SSH không phải cổng 22 (máy sau NAT port-forward, 2026-11-13): đặt repository variable
+#   VM1_SSH_PORT / VM2_SSH_PORT (Settings → Variables); trống = 22.
 # Trên VM: IP/mật khẩu nội bộ nằm trong ~/craw-sict/.env của VM (xem .env.worker.example), KHÔNG ghi cứng ở đây.
 on:
   push:
@@ -99,6 +101,7 @@ jobs:
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.VM1_HOST }}
+          port: ${{ vars.VM1_SSH_PORT || 22 }}
           username: ubuntu
           key: ${{ secrets.VM1_KEY }}
           source: docker-compose.yml,config.yaml,nginx/nginx.conf,scripts/monitor_2vm.sh,scripts/store_auth.sh
@@ -111,6 +114,7 @@ jobs:
           GH_ACTOR: ${{ github.actor }}
         with:
           host: ${{ secrets.VM1_HOST }}
+          port: ${{ vars.VM1_SSH_PORT || 22 }}
           username: ubuntu
           key: ${{ secrets.VM1_KEY }}
           envs: API_IMAGE,GH_TOKEN,GH_ACTOR
@@ -152,9 +156,10 @@ jobs:
       - uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.VM2_HOST }}
+          port: ${{ vars.VM2_SSH_PORT || 22 }}
           username: ubuntu
           key: ${{ secrets.VM2_KEY }}
-          source: docker-compose.worker.yml,config.yaml,scripts/monitor_2vm.sh,scripts/store_auth.sh
+          source: docker-compose.worker.yml,docker-compose.worker-lite.yml,config.yaml,scripts/monitor_2vm.sh,scripts/store_auth.sh
           target: ~/craw-sict
       - name: Pull + up worker (compose `cron` là đường worker DUY NHẤT — D9)
         uses: appleboy/ssh-action@v1
@@ -164,6 +169,7 @@ jobs:
           GH_ACTOR: ${{ github.actor }}
         with:
           host: ${{ secrets.VM2_HOST }}
+          port: ${{ vars.VM2_SSH_PORT || 22 }}
           username: ubuntu
           key: ${{ secrets.VM2_KEY }}
           envs: WORKER_IMAGE,GH_TOKEN,GH_ACTOR
@@ -200,6 +206,7 @@ jobs:
       - uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.VM2_HOST }}
+          port: ${{ vars.VM2_SSH_PORT || 22 }}
           username: ubuntu
           key: ${{ secrets.VM2_KEY }}
           source: docker-compose.embed.yml
@@ -212,6 +219,7 @@ jobs:
           GH_ACTOR: ${{ github.actor }}
         with:
           host: ${{ secrets.VM2_HOST }}
+          port: ${{ vars.VM2_SSH_PORT || 22 }}
           username: ubuntu
           key: ${{ secrets.VM2_KEY }}
           envs: EMBED_IMAGE,GH_TOKEN,GH_ACTOR
