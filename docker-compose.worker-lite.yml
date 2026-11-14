@@ -13,7 +13,7 @@
 #   EMBED_API_BASE=https://api.jina.ai/v1 (Jina Cloud — máy worker không nhốt embed), EMBED_API_KEY=<khóa>.
 x-worker-v3-env: &worker_v3_env
   EMBED_BACKEND: ${EMBED_BACKEND:-api}
-  EMBED_API_BASE: ${EMBED_API_BASE:-http://embed:8090/v1}
+  EMBED_API_BASE: ${EMBED_API_BASE:-https://api.jina.ai/v1}
   EMBED_API_KEY: ${EMBED_API_KEY:-}
   EMBED_MODEL: ${EMBED_MODEL:-jina-clip-v2}
   EMBED_DIM: ${EMBED_DIM:-1024}
@@ -46,19 +46,19 @@ services:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       QDRANT_TIMEOUT: ${QDRANT_TIMEOUT:-120}
       YT_COOKIES: ${YT_COOKIES:-/cookies/cookies.txt}
-      AWS_PROFILE: ${AWS_PROFILE:-quyen-admin}
+      AWS_PROFILE: ${AWS_PROFILE:-}
       CHECK_EDITS: ${CHECK_EDITS:-50}
       CRAWL_LIMIT: ${CRAWL_LIMIT:-200}
       ANNOTATE_OCR_N: ${ANNOTATE_OCR_N:-500}
       CYCLE_BUDGET_SEC: ${CYCLE_BUDGET_SEC:-300}
       CRON_INTERVAL_SEC: ${CRON_INTERVAL_SEC:-43200}
     volumes:
-      - localstore:/app/_local_store
+      - "${WORKER_LOCAL_STORE:-localstore}:/app/_local_store"
       - hfcache:/cache/hf
-      - "${AWS_DIR:-${HOME}/.aws}:/home/app/.aws:ro"
       - "./cookies:/cookies:ro"
     restart: unless-stopped
     mem_limit: ${CRON_MEM_LIMIT:-512m}
+    memswap_limit: ${CRON_MEMSWAP_LIMIT:-1024m}
     logging: {driver: json-file, options: {max-size: 20m, max-file: "3"}}
     command: >
       /bin/sh -c "while true; do

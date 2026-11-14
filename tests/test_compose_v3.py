@@ -135,6 +135,7 @@ def _compose_available() -> bool:
     ["docker-compose.yml", "docker-compose.worker.yml"],
     ["docker-compose.yml", "docker-compose.worker.yml", "docker-compose.embed.yml"],
     ["docker-compose.worker.yml", "docker-compose.embed.yml"],                       # VM2
+    ["docker-compose.yml", "docker-compose.small.yml"],
     ["docker-compose.worker-lite.yml"],                                                # worker 512 MB
 ])
 def test_compose_config_renders_without_env(files):
@@ -173,3 +174,12 @@ def test_graph_only_cli_flags_exist():
     src = inspect.getsource(M.main)
     assert '"--skip-graph"' in src and '"--graph-only"' in src
     assert "run_graph_stage" in src
+
+
+def test_small_vm_media_is_shared_and_read_only_in_api():
+    api = _services("docker-compose.small.yml")["api"]
+    assert "./_local_store:/app/_local_store:ro" in api["volumes"]
+    assert api["environment"]["AWS_PROFILE"] == ""
+    worker = _services("docker-compose.worker-lite.yml")["cron"]
+    assert worker["volumes"][0] == "${WORKER_LOCAL_STORE:-localstore}:/app/_local_store"
+    assert worker["memswap_limit"] == "${CRON_MEMSWAP_LIMIT:-1024m}"

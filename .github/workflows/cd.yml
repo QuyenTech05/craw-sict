@@ -45,7 +45,7 @@ permissions:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 25
     outputs:
       tag: ${{ steps.t.outputs.tag }}
     steps:
@@ -92,7 +92,7 @@ jobs:
     needs: prepare
     # push trigger thì `inputs` rỗng → coi như target=all (deploy cả 2 VM)
     if: inputs.target == 'all' || inputs.target == 'vm1' || github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     environment: production
     steps:
@@ -102,9 +102,9 @@ jobs:
         with:
           host: ${{ secrets.VM1_HOST }}
           port: ${{ vars.VM1_SSH_PORT || 22 }}
-          username: ubuntu
+          username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
           key: ${{ secrets.VM1_KEY }}
-          source: docker-compose.yml,config.yaml,nginx/nginx.conf,scripts/monitor_2vm.sh,scripts/store_auth.sh
+          source: docker-compose.yml,docker-compose.small.yml,config.yaml,nginx/nginx.conf,scripts/monitor_2vm.sh,scripts/store_auth.sh
           target: ~/craw-sict
       - name: Pull + up (infra, api, nginx)
         uses: appleboy/ssh-action@v1
@@ -115,7 +115,7 @@ jobs:
         with:
           host: ${{ secrets.VM1_HOST }}
           port: ${{ vars.VM1_SSH_PORT || 22 }}
-          username: ubuntu
+          username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
           key: ${{ secrets.VM1_KEY }}
           envs: API_IMAGE,GH_TOKEN,GH_ACTOR
           command_timeout: 25m
@@ -148,7 +148,7 @@ jobs:
   deploy-vm2:
     needs: prepare
     if: inputs.target == 'all' || inputs.target == 'vm2' || github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     environment: production
     steps:
@@ -157,7 +157,7 @@ jobs:
         with:
           host: ${{ secrets.VM2_HOST }}
           port: ${{ vars.VM2_SSH_PORT || 22 }}
-          username: ubuntu
+          username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
           key: ${{ secrets.VM2_KEY }}
           source: docker-compose.worker.yml,docker-compose.worker-lite.yml,config.yaml,scripts/monitor_2vm.sh,scripts/store_auth.sh
           target: ~/craw-sict
@@ -170,7 +170,7 @@ jobs:
         with:
           host: ${{ secrets.VM2_HOST }}
           port: ${{ vars.VM2_SSH_PORT || 22 }}
-          username: ubuntu
+          username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
           key: ${{ secrets.VM2_KEY }}
           envs: WORKER_IMAGE,GH_TOKEN,GH_ACTOR
           command_timeout: 25m
@@ -187,18 +187,23 @@ jobs:
             # D9: bỏ vòng `docker run` cũ chạy song song với compose cron (2 incremental cùng lúc)
             docker rm -f sict-worker-24h 2>/dev/null && echo "đã gỡ sict-worker-24h" || true
             echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
-            docker compose -f docker-compose.worker.yml pull cron
+            compose_file="${{ vars.WORKER_COMPOSE || 'docker-compose.worker.yml' }}"
+            case "$compose_file" in docker-compose.worker.yml|docker-compose.worker-lite.yml) ;; *) exit 2 ;; esac
+            docker compose -f "$compose_file" pull cron
             docker logout ghcr.io
-            docker compose -f docker-compose.worker.yml up -d obscura cron
-            docker run --rm "$WORKER_IMAGE" python -c "import sict_crawler.service.retrieval.agent"
+            if [ "$compose_file" = docker-compose.worker-lite.yml ]; then
+              docker compose -f "$compose_file" up -d cron
+            else
+              docker compose -f "$compose_file" up -d obscura cron
+            fi
             sleep 20
-            docker compose -f docker-compose.worker.yml ps --format 'table {{.Name}}\t{{.Image}}\t{{.Status}}'
-            docker compose -f docker-compose.worker.yml ps --status running cron | grep -q cron
+            docker compose -f "$compose_file" ps --format 'table {{.Name}}\t{{.Image}}\t{{.Status}}'
+            docker compose -f "$compose_file" ps --status running cron | grep -q cron
 
   deploy-embed:
     needs: [prepare, deploy-vm2]
     if: always() && needs.prepare.result == 'success' && inputs.deploy_embed == true && (inputs.target == 'all' || inputs.target == 'vm2' || github.event_name == 'push')
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 75
     environment: production
     steps:
@@ -207,7 +212,7 @@ jobs:
         with:
           host: ${{ secrets.VM2_HOST }}
           port: ${{ vars.VM2_SSH_PORT || 22 }}
-          username: ubuntu
+          username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
           key: ${{ secrets.VM2_KEY }}
           source: docker-compose.embed.yml
           target: ~/craw-sict
@@ -220,7 +225,7 @@ jobs:
         with:
           host: ${{ secrets.VM2_HOST }}
           port: ${{ vars.VM2_SSH_PORT || 22 }}
-          username: ubuntu
+          username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
           key: ${{ secrets.VM2_KEY }}
           envs: EMBED_IMAGE,GH_TOKEN,GH_ACTOR
           command_timeout: 70m
@@ -243,7 +248,7 @@ jobs:
   deploy-alloy:
     needs: [prepare, deploy-vm1, deploy-vm2]
     if: always() && needs.prepare.result == 'success' && inputs.deploy_alloy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     environment: production
     strategy:

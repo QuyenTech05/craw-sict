@@ -12,10 +12,10 @@ chỉ đổi giới hạn RAM và backend crawler.
 | VM2 (512 MB) | Eco Micro | cron incremental (+ graph ngay sau lượt) | `docker-compose.worker-lite.yml` |
 | Media | R2/B2/MinIO | ảnh + file, dùng chung 2 máy qua S3 API | — |
 
-Vì sao chạy được (số đo, không đoán): toàn bộ stack rỗi **660 MiB** trên dev box; worker
+Số đo tham khảo trên dev box: toàn bộ stack rỗi khoảng **660 MiB**; worker
 **< 200 MiB ở 99,7%** mẫu của trial 24 ngày; đỉnh 400–969 MiB là cửa sổ rebuild graph
 → tách sang `--graph-only` chạy ngay sau lượt (cùng vòng lặp cron), corpus không đổi thì
-skip theo chữ ký `graph:corpus_sig`.
+skip theo chữ ký `graph:corpus_sig`. Các số này chưa chứng minh graph vừa RAM 512 MB.
 
 ## Bước làm theo thứ tự
 
@@ -55,3 +55,20 @@ skip theo chữ ký `graph:corpus_sig`.
 `cd.yml` hiện SSH cổng 22. Máy NAT chỉ mở `30037`/`30075` → thêm biến môi trường
 `VM1_SSH_PORT`/`VM2_SSH_PORT` (mặc định 22) vào workflow, hoặc map port 22 trong
 `.ssh/config` trên runner. KHÔNG mở store ra ngoài chỉ vì CD — CD chỉ cần SSH + docker.
+
+## Triển khai qua Tailscale (2026-11-15)
+
+- GitHub variables: `DEPLOY_RUNNER=sict-deploy`, `VM_SSH_USER=root`,
+  `WORKER_COMPOSE=docker-compose.worker-lite.yml`, `VM1_SSH_PORT=22`, `VM2_SSH_PORT=22`.
+  Secrets `VM1_HOST`/`VM2_HOST` là IP Tailscale; SSH key tách riêng cho triển khai.
+- Runner `sict-dev-tailnet` chạy trên máy dev bằng user service `sict-deploy-runner`;
+  chỉ job CD dùng runner này, CI/build vẫn chạy trên GitHub. Máy dev phải bật để CD chạy.
+- VM1 đặt `COMPOSE_FILE=docker-compose.yml:docker-compose.small.yml`; API đọc
+  `./_local_store` chỉ đọc. Store bind IP Tailscale, không mở cổng store trên IP public.
+- VM2 đặt `WORKER_LOCAL_STORE=./_local_store`. Đồng bộ media sang VM1 bằng rsync qua SSH,
+  không dùng AWS credentials. Media có độ trễ bằng chu kỳ timer đồng bộ.
+- `mem_limit` chỉ chặn RAM container; `memswap_limit` là tổng RAM + swap cho phép.
+  Swap phải có thật và LXC phải được host cho phép. Tách tiến trình graph không tự giảm
+  lượng RAM mà riêng graph cần. Kiểm OOM và lượt graph thật trước khi nhận chạy ổn.
+- Jina phải trả embedding thành công; HTTP 403 `AUTHZ_INSUFFICIENT_BALANCE` là lỗi
+  key/số dư, không thể khắc phục bằng tăng RAM hoặc đổi ngưỡng retrieval.
