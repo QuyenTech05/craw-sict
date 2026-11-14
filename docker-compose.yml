@@ -19,16 +19,16 @@ services:
     # Đỉnh đo 148 MiB (2026-11-01); shared_buffers 256 MB + 50 kết nối → 600 MB đủ. Tổng mem_limit VM1 = 3.650 MB
     # (pg 600 + redis 300 + qdrant 1.100 + api 1.500 + nginx 150), chừa ~450 MB cho OS + Alloy trên 4 GB.
     mem_limit: ${PG_MEM_LIMIT:-600m}
-    command: ["postgres", "-c", "shared_buffers=256MB", "-c", "max_connections=50"]
+    command: ["postgres", "-c", "shared_buffers=${PG_SHARED_BUFFERS:-256MB}", "-c", "max_connections=${PG_MAX_CONNECTIONS:-50}"]
 
   redis:
     image: redis:7
-    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-ttl",
+    command: ["redis-server", "--maxmemory", "${REDIS_MAXMEMORY:-256mb}", "--maxmemory-policy", "volatile-ttl",
               "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-}"]
     ports: ["${STORE_BIND:-127.0.0.1}:6379:6379"]
     volumes: [redisdata:/data]
     restart: unless-stopped
-    mem_limit: 300m
+    mem_limit: ${REDIS_MEM_LIMIT:-300m}
 
   qdrant:
     image: qdrant/qdrant:v1.19.1   # ghim (D11): bản đang chứa index v3; nâng = đổi tag có chủ đích
@@ -49,8 +49,8 @@ services:
     ports: ["8003:8000"]  # host 8000/8001 đã bị project khác chiếm
     env_file: [{path: .env, required: false}]  # fresh clone chưa có .env vẫn up được (dùng defaults)
     environment:
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_MODEL: ${LLM_MODEL:-}
@@ -83,7 +83,7 @@ services:
     volumes: ["./nginx/nginx.conf:/etc/nginx/nginx.conf:ro", ngcache:/var/cache/nginx]
     depends_on: [api]
     restart: unless-stopped
-    mem_limit: 150m
+    mem_limit: ${NGINX_MEM_LIMIT:-150m}
     logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
 
 volumes:
