@@ -5,6 +5,6 @@ set -euo pipefail
 : "${MEDIA_SYNC_KEY:?thiếu MEDIA_SYNC_KEY}"
 store=${MEDIA_SOURCE:-/root/craw-sict/_local_store}
 remote=${MEDIA_DESTINATION:-/root/craw-sict/_local_store}
-rsync -a --ignore-existing --delay-updates \
-  -e "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -i $MEDIA_SYNC_KEY" \
+rsync -a --timeout=60 --ignore-existing --delay-updates \
+  -e "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -i $MEDIA_SYNC_KEY" \
   "$store/" "root@$MEDIA_API_HOST:$remote/"

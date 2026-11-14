@@ -78,8 +78,8 @@ skip theo chữ ký `graph:corpus_sig`. Các số này chưa chứng minh graph 
 ### LXC không có /dev/net/tun
 
 Tailscale userspace nhận SSH được nhưng không tạo route 100.64.0.0/10 cho ứng dụng.
-Trên VM2, bốn user service `sict-tailnet-{5432,6379,6333,6334}` dùng socat +
-`tailscale nc <VM1> <port>`, chỉ listen 127.0.0.1. Đặt `WORKER_NETWORK_MODE=host`
-và DSN/Redis/Qdrant trỏ 127.0.0.1; đây là proxy nội bộ tới VM1, không phải store cục bộ.
+Trên VM2, bốn service `sict-tailnet-{5432,6379,6333,6334}` dùng socat +
+`tailscale nc <VM1> <port>`, chỉ listen IP bridge Docker 172.17.0.1.
+DSN/Redis/Qdrant của worker trỏ IP bridge đó; các service chuyển tiếp tới store VM1.
 SSH từ VM2 sang VM1 dùng `ProxyCommand /usr/bin/tailscale nc %h %p` trong
 /root/.ssh/config, kể cả rsync media. Không mở store trên internet công cộng.
