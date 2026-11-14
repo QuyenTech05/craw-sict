@@ -59,7 +59,7 @@ skip theo chữ ký `graph:corpus_sig`. Các số này chưa chứng minh graph 
 ## Triển khai qua Tailscale (2026-11-15)
 
 - GitHub variables: `DEPLOY_RUNNER=sict-deploy`, `VM_SSH_USER=root`,
-  `WORKER_COMPOSE=docker-compose.worker-lite.yml`, `VM1_SSH_PORT=22`, `VM2_SSH_PORT=22`.
+  `WORKER_COMPOSE=docker-compose.worker-lite.yml`, `VM1_SSH_PORT=2222`, `VM2_SSH_PORT=2222`.
   Secrets `VM1_HOST`/`VM2_HOST` là IP Tailscale; SSH key tách riêng cho triển khai.
 - Runner `sict-dev-tailnet` chạy trên máy dev bằng user service `sict-deploy-runner`;
   chỉ job CD dùng runner này, CI/build vẫn chạy trên GitHub. Máy dev phải bật để CD chạy.
@@ -83,3 +83,8 @@ Trên VM2, bốn service `sict-tailnet-{5432,6379,6333,6334}` dùng socat +
 DSN/Redis/Qdrant của worker trỏ IP bridge đó; các service chuyển tiếp tới store VM1.
 SSH từ VM2 sang VM1 dùng `ProxyCommand /usr/bin/tailscale nc %h %p` trong
 /root/.ssh/config, kể cả rsync media. Không mở store trên internet công cộng.
+
+SSH triển khai dùng service `sict-deploy-sshd` cổng 2222, chỉ cho key:
+VM1 bind IP Tailscale; VM2 userspace bind 127.0.0.1 để netstack chuyển tiếp.
+Tailscale SSH cổng 22 vẫn giữ check policy; automation dùng key OpenSSH qua tailnet,
+không phụ thuộc phiên xác thực trình duyệt. Media timer đặt `MEDIA_SSH_PORT=2222`.
