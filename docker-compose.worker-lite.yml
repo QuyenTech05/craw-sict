@@ -1,0 +1,71 @@
+# Worker RẸ cho máy nhỏ 512 MB (2026-11-13): thay docker-compose.worker.yml trên VM worker 1 vCPU / 512 MB.
+#
+# Khác bản đầy đủ (từ số đo trial-24h 30.052 mẫu / 12 ngày):
+#   - BỎ obscura (Chrome headless, +150 MB) → CRAWLER_BACKEND=httpx: trang JS thuần lấy được HTML rỗng → bỏ qua
+#     bài đó (SICT crawl được bằng httpx từ trước khi có Obscura).
+#   - CRON_MEM_LIMIT=512m (đỉnh worker <200 MiB ở 99,7% thời gian; đỉnh 400–969 MiB là cửa sổ graph rebuild →
+#     tách graph sang --graph-only chạy NGAY SAU lượt, vẫn tôn trọng chữ ký corpus `graph:corpus_sig` nên
+#     corpus không đổi → bỏ qua, không rebuild 12h/lần vô ích).
+#   - svc-ocr không có trong file này (chỉ dùng cho collection v1).
+#
+# Chạy: docker compose -f docker-compose.worker-lite.yml up -d
+# .env theo .env.worker.example nhưng: CRAWLER_BACKEND=httpx, CRON_MEM_LIMIT=512m,
+#   EMBED_API_BASE=https://api.jina.ai/v1 (Jina Cloud — máy worker không nhốt embed), EMBED_API_KEY=<khóa>.
+x-worker-v3-env: &worker_v3_env
+  EMBED_BACKEND: ${EMBED_BACKEND:-api}
+  EMBED_API_BASE: ${EMBED_API_BASE:-https://api.jina.ai/v1}
+  EMBED_API_KEY: ${EMBED_API_KEY:-}
+  EMBED_MODEL: ${EMBED_MODEL:-jina-clip-v2}
+  EMBED_DIM: ${EMBED_DIM:-1024}
+  EMBED_QUERY_IMAGE_SIZE: ${EMBED_QUERY_IMAGE_SIZE:-}
+  EMBED_CACHE_PATH: ${EMBED_CACHE_PATH:-}
+  QDRANT_PORT: ${QDRANT_PORT:-}
+  QDRANT_GRPC_PORT: ${QDRANT_GRPC_PORT:-}
+  QDRANT_COLLECTION_TEXT: ${QDRANT_COLLECTION_TEXT:-}
+  QDRANT_COLLECTION_IMAGE: ${QDRANT_COLLECTION_IMAGE:-}
+  QDRANT_COLLECTION_OCR: ${QDRANT_COLLECTION_OCR:-}
+  QDRANT_TEXT_DIM: ${QDRANT_TEXT_DIM:-}
+  QDRANT_IMAGE_DIM: ${QDRANT_IMAGE_DIM:-}
+  CHUNK_STRUCTURED: ${CHUNK_STRUCTURED:-}
+  HF_HOME: /cache/hf
+
+services:
+  cron:
+    image: ${WORKER_IMAGE:-sict-worker:latest}
+    env_file: [{path: .env, required: false}]
+    environment:
+      <<: *worker_v3_env
+      SICT_CONFIG: /app/config.yaml
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      CRAWLER_BACKEND: ${CRAWLER_BACKEND:-httpx}
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql+asyncpg://sict:${POSTGRES_PASSWORD:-sict}@postgres:5432/sict_crawler}
+      REDIS_URL: ${REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+      QDRANT_HOST: ${QDRANT_HOST:-qdrant}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT:-120}
+      YT_COOKIES: ${YT_COOKIES:-/cookies/cookies.txt}
+      AWS_PROFILE: ${AWS_PROFILE:-}
+      CHECK_EDITS: ${CHECK_EDITS:-50}
+      CRAWL_LIMIT: ${CRAWL_LIMIT:-200}
+      ANNOTATE_OCR_N: ${ANNOTATE_OCR_N:-500}
+      CYCLE_BUDGET_SEC: ${CYCLE_BUDGET_SEC:-300}
+      CRON_INTERVAL_SEC: ${CRON_INTERVAL_SEC:-43200}
+    volumes:
+      - "${WORKER_LOCAL_STORE:-localstore}:/app/_local_store"
+      - hfcache:/cache/hf
+      - "./cookies:/cookies:ro"
+    restart: unless-stopped
+    mem_limit: ${CRON_MEM_LIMIT:-512m}
+    memswap_limit: ${CRON_MEMSWAP_LIMIT:-1024m}
+    logging: {driver: json-file, options: {max-size: 20m, max-file: "3"}}
+    command: >
+      /bin/sh -c "while true; do
+        python -m sict_crawler.pipeline.main --incremental --skip-graph --check-edits $$CHECK_EDITS --crawl-limit $$CRAWL_LIMIT --annotate-ocr-n $$ANNOTATE_OCR_N --budget-sec $$CYCLE_BUDGET_SEC;
+        python -m sict_crawler.pipeline.main --graph-only;
+        sleep $$CRON_INTERVAL_SEC; done"
+
+volumes:
+  localstore:
+  hfcache:

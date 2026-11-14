@@ -1,0 +1,11 @@
+# Máy nhỏ: media lưu trên đĩa, store chỉ bind IP Tailscale trong .env.
+# .env: COMPOSE_FILE=docker-compose.yml:docker-compose.small.yml
+services:
+  api:
+    volumes:
+      - ./_local_store:/app/_local_store:ro
+    environment:
+      AWS_PROFILE: ""
+      AWS_ACCESS_KEY_ID: ""
+      AWS_SECRET_ACCESS_KEY: ""
+      SICT_LOCAL_STORE: /app/_local_store
