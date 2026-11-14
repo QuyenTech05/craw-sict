@@ -31,6 +31,7 @@ x-worker-v3-env: &worker_v3_env
 
 services:
   cron:
+    network_mode: ${WORKER_NETWORK_MODE:-bridge}
     image: ${WORKER_IMAGE:-sict-worker:latest}
     env_file: [{path: .env, required: false}]
     environment:

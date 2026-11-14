@@ -74,3 +74,12 @@ skip theo chữ ký `graph:corpus_sig`. Các số này chưa chứng minh graph 
   lượng RAM mà riêng graph cần. Kiểm OOM và lượt graph thật trước khi nhận chạy ổn.
 - Jina phải trả embedding thành công; HTTP 403 `AUTHZ_INSUFFICIENT_BALANCE` là lỗi
   key/số dư, không thể khắc phục bằng tăng RAM hoặc đổi ngưỡng retrieval.
+
+### LXC không có /dev/net/tun
+
+Tailscale userspace nhận SSH được nhưng không tạo route 100.64.0.0/10 cho ứng dụng.
+Trên VM2, bốn user service `sict-tailnet-{5432,6379,6333,6334}` dùng socat +
+`tailscale nc <VM1> <port>`, chỉ listen 127.0.0.1. Đặt `WORKER_NETWORK_MODE=host`
+và DSN/Redis/Qdrant trỏ 127.0.0.1; đây là proxy nội bộ tới VM1, không phải store cục bộ.
+SSH từ VM2 sang VM1 dùng `ProxyCommand /usr/bin/tailscale nc %h %p` trong
+/root/.ssh/config, kể cả rsync media. Không mở store trên internet công cộng.
