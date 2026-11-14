@@ -86,7 +86,12 @@ env_check() {   # chỉ báo TÊN biến thiếu / sai; giá trị không bao gi
 qcurl() {   # qcurl <url gốc Qdrant> <đường dẫn> [tham số curl…]; API key qua header đọc từ ENV_FILE, không lên dòng lệnh
   local base=$1 path=$2; shift 2
   local qkey; qkey="$(val QDRANT_API_KEY)"
-  curl -sS --fail-with-body -H @<(printf 'api-key: %s' "$qkey") "$base$path" "$@"
+  # Ubuntu 20.04 có curl 7.68, chưa hỗ trợ --fail-with-body.
+  if curl --help all | grep -q -- --fail-with-body; then
+    curl -sS --fail-with-body -H @<(printf 'api-key: %s' "$qkey") "$base$path" "$@"
+  else
+    curl -sS -f -H @<(printf 'api-key: %s' "$qkey") "$base$path" "$@"
+  fi
 }
 qdrant_curl() { qcurl "$QDRANT_URL" "$@"; }   # Qdrant của máy đang đứng (VM1: compose qdrant)
 

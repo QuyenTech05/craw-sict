@@ -66,7 +66,9 @@ skip theo chữ ký `graph:corpus_sig`. Các số này chưa chứng minh graph 
 - VM1 đặt `COMPOSE_FILE=docker-compose.yml:docker-compose.small.yml`; API đọc
   `./_local_store` chỉ đọc. Store bind IP Tailscale, không mở cổng store trên IP public.
 - VM2 đặt `WORKER_LOCAL_STORE=./_local_store`. Đồng bộ media sang VM1 bằng rsync qua SSH,
-  không dùng AWS credentials. Media có độ trễ bằng chu kỳ timer đồng bộ.
+  không dùng AWS credentials. `sict-media-sync.timer` gọi `scripts/sync_worker_media.sh`
+  mỗi 30 giây với `MEDIA_API_HOST`/`MEDIA_SYNC_KEY` trong `/etc/sict-media-sync.env`.
+  Media có độ trễ tối đa một chu kỳ đồng bộ, cộng thời gian truyền file.
 - `mem_limit` chỉ chặn RAM container; `memswap_limit` là tổng RAM + swap cho phép.
   Swap phải có thật và LXC phải được host cho phép. Tách tiến trình graph không tự giảm
   lượng RAM mà riêng graph cần. Kiểm OOM và lượt graph thật trước khi nhận chạy ổn.
