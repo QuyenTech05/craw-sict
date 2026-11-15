@@ -1,6 +1,8 @@
 # Máy nhỏ: media lưu trên đĩa, store chỉ bind IP Tailscale trong .env.
 # .env: COMPOSE_FILE=docker-compose.yml:docker-compose.small.yml
 services:
+  qdrant:
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.1}
   api:
     volumes:
       - ./_local_store:/app/_local_store:ro

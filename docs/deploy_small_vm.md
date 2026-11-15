@@ -88,3 +88,11 @@ SSH triển khai dùng service `sict-deploy-sshd` cổng 2222, chỉ cho key:
 VM1 bind IP Tailscale; VM2 userspace bind 127.0.0.1 để netstack chuyển tiếp.
 Tailscale SSH cổng 22 vẫn giữ check policy; automation dùng key OpenSSH qua tailnet,
 không phụ thuộc phiên xác thực trình duyệt. Media timer đặt `MEDIA_SSH_PORT=2222`.
+
+### CPU không có AVX trên VM1
+
+Qdrant 1.19.1 chính thức biên dịch chung phần SSE với `-march=haswell`; trên Xeon X5650,
+`impl_score_dot_sse` gặp SIGILL trong lúc xử lý quantization. `scripts/build_qdrant_sse.sh`
+build đúng commit upstream với patch chỉ tách cờ compiler cho SSE và AVX2. Build trên máy dev,
+kiểm assembly và restore/query thực tế trước khi dùng. VM1 đặt
+`QDRANT_IMAGE=sict-qdrant:1.19.1-sse-compatible` sau khi image được chuyển tới VM.

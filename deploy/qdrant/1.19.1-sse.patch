@@ -1,0 +1,16 @@
+diff --git a/lib/quantization/build.rs b/lib/quantization/build.rs
+index 567018b..bf46460 100644
+--- a/lib/quantization/build.rs
++++ b/lib/quantization/build.rs
+@@ -17,7 +17,10 @@ fn main() {
+         .expect("CARGO_CFG_TARGET_FEATURE env-var is not defined or is not UTF-8");
+ 
+     if target_arch == "x86_64" {
+-        builder.file("cpp/sse.c");
++        // SSE code must not contain AVX: the CPU dispatcher calls it on SSE-only hosts.
++        let mut sse = cc::Build::new();
++        sse.file("cpp/sse.c").flag("-msse4.1").flag("-mpopcnt").flag("-O3");
++        sse.compile("simd_sse_compat");
+         builder.file("cpp/avx2.c");
+ 
+         if builder.get_compiler().is_like_msvc() {
