@@ -36,7 +36,7 @@ def test_gradio_http_query_and_document(monkeypatch):
     monkeypatch.setattr(httpx, 'post', post)
     monkeypatch.setattr(httpx, 'stream', stream)
     assert E._hf_gradio_texts(['câu hỏi'], 'query') == [[1.0,2.0,3.0]]
-    assert calls[0][1]['json']['data'] == [['câu hỏi'], 'query', 3]
+    assert calls[0][1]['json']['data'] == [{'type':'text', 'input':'câu hỏi', 'task':'query'}, 'query', 3]
     assert calls[0][1]['headers']['Authorization'] == calls[1][1]['headers']['Authorization'] == 'Bearer private-token'
     assert calls[1][0].endswith('/gradio_api/call/embed/abc')
 
@@ -84,3 +84,18 @@ def test_space_rejects_wrong_dimensions(monkeypatch):
         'data: '+json.dumps([{'status':'success','embeddings':[[1,2]]}]),'']))
     with pytest.raises(E.EmbedError, match='kích thước'):
         E._hf_gradio_texts(['văn bản'], 'document')
+
+
+def test_image_uses_unified_typed_endpoint(monkeypatch):
+    import httpx
+    config = SimpleNamespace(hf_space_url='https://example.test', hf_token='token', dim=3, timeout=20)
+    monkeypatch.setattr(E, 'get_settings', lambda: SimpleNamespace(embedding=config))
+    calls = []
+    def post(url, **kwargs):
+        calls.append(kwargs['json'])
+        return Response({'event_id':'abc'})
+    monkeypatch.setattr(httpx, 'post', post)
+    monkeypatch.setattr(httpx, 'stream', lambda *a, **k: Response(lines=['event: complete',
+        'data: '+json.dumps([{'status':'success','embeddings':[[1,2,3]]}]),'']))
+    assert E._hf_gradio_image('ZmFrZQ==') == [1.0, 2.0, 3.0]
+    assert calls[0]['data'] == [{'type':'image','input':'ZmFrZQ=='}, 'query', 3]

@@ -267,14 +267,14 @@ def _post(items: list[dict]) -> list[list[float]]:
     raise EmbedError(f"embedding endpoint lỗi sau {e.api_retries} lần: {last}")
 
 
-def _hf_gradio_texts(texts: list[str], kind: str) -> list[list[float]]:
+def _hf_gradio_request(payload: dict, kind: str, expected: int) -> list[list[float]]:
     """Space Gradio: POST nhận event_id, GET SSE nhận vector; token gửi ở cả hai lượt."""
     import httpx
     e = get_settings().embedding
     url = e.hf_space_url.rstrip("/") + "/gradio_api/call/embed"
     headers = {"Authorization": f"Bearer {e.hf_token}"} if e.hf_token else {}
     try:
-        r = httpx.post(url, json={"data": [texts, kind, e.dim]}, headers=headers, timeout=e.timeout)
+        r = httpx.post(url, json={"data": [payload, kind, e.dim]}, headers=headers, timeout=e.timeout)
         r.raise_for_status()
         body = r.json()
         event_id = body.get("event_id") if isinstance(body, dict) else None
@@ -296,7 +296,7 @@ def _hf_gradio_texts(texts: list[str], kind: str) -> list[list[float]]:
                         message = result.get("message", "inference thất bại") if isinstance(result, dict) else "inference thất bại"
                         raise EmbedError(f"Space: {message}")
                     rows = result.get("embeddings")
-                    if not isinstance(rows, list) or len(rows) != len(texts):
+                    if not isinstance(rows, list) or len(rows) != expected:
                         raise EmbedError("Space trả sai số vector")
                     if any(not isinstance(row, list) or len(row) != e.dim or
                            any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in row) for row in rows):
@@ -305,6 +305,15 @@ def _hf_gradio_texts(texts: list[str], kind: str) -> list[list[float]]:
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         raise EmbedError(f"Space HTTP/SSE lỗi: {type(exc).__name__}") from exc
     raise EmbedError("Space không gửi sự kiện hoàn tất")
+
+
+def _hf_gradio_texts(texts: list[str], kind: str) -> list[list[float]]:
+    value = texts[0] if len(texts) == 1 else texts
+    return _hf_gradio_request({"type": "text", "input": value, "task": kind}, kind, len(texts))
+
+
+def _hf_gradio_image(image_base64: str) -> list[float]:
+    return _hf_gradio_request({"type": "image", "input": image_base64}, "query", 1)[0]
 
 
 def _embed_cached(kind: str, keys: list[bytes], make, batch: int, post=None) -> list[list[float] | None]:
@@ -380,9 +389,15 @@ def _api_embed_image_bytes(images: list[bytes], query_size: int = 0) -> tuple[li
             return None
         return {"image": base64.b64encode(jpg).decode("ascii"), **({"image_size": query_size} if query_size else {})}
 
+    e = get_settings().embedding
     kind = f"iq{query_size}" if query_size else f"i{IMAGE_MAX_SIDE}"
-    vecs = _embed_cached(kind, [hashlib.sha256(b).digest() for b in images], make,
-                         get_settings().embedding.api_image_batch)
+    if e.image_provider == "hf-space":
+        # Space nhận một ảnh mỗi lượt, tự tiền xử lý ảnh; cache tách khỏi backend Jina.
+        kind = f"hf-space:{e.hf_space_url}:{kind}"
+        vecs = _embed_cached(kind, [hashlib.sha256(b).digest() for b in images], make, 1,
+                             post=lambda items: [_hf_gradio_image(it["image"]) for it in items])
+    else:
+        vecs = _embed_cached(kind, [hashlib.sha256(b).digest() for b in images], make, e.api_image_batch)
     ok = [i for i, v in enumerate(vecs) if v is not None]
     return [vecs[i] for i in ok], ok
 
