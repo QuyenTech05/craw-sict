@@ -65,9 +65,9 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       HF_HOME: /cache/hf  # share model cache, khỏi tải lại E5/CLIP mỗi recreate
-      AWS_PROFILE: ${AWS_PROFILE:-quyen-admin}
+      AWS_PROFILE: ${AWS_PROFILE-quyen-admin}
     depends_on: [postgres, redis, qdrant]
-    volumes: [hfcache:/cache/hf, "${AWS_DIR:-${HOME}/.aws}:/home/app/.aws:ro"]
+    volumes: [hfcache:/cache/hf, "${AWS_DIR:-${HOME}/.aws}:/home/app/.aws:ro", "${API_LOCAL_STORE:-api_localstore}:/app/_local_store:ro"]
     restart: unless-stopped
     # Index v2 (mặc định, embedding.backend torch): API tự nạp E5 + CLIP → đo 2026-11-01 anon ~820 MiB + ~600 MiB
     # cache file model, chạm 1,5 GB → giữ 1.500 MB. Sau cutover v3 (EMBED_BACKEND=api, embed ở VM2) API chỉ
@@ -90,5 +90,6 @@ volumes:
   pgdata:
   qdata:
   hfcache:
+  api_localstore:
   ngcache:
   redisdata:  # persist frontier/seen + heartbeat (restart không mất hàng đợi)

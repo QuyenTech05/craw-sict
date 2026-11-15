@@ -88,3 +88,31 @@ SSH triển khai dùng service `sict-deploy-sshd` cổng 2222, chỉ cho key:
 VM1 bind IP Tailscale; VM2 userspace bind 127.0.0.1 để netstack chuyển tiếp.
 Tailscale SSH cổng 22 vẫn giữ check policy; automation dùng key OpenSSH qua tailnet,
 không phụ thuộc phiên xác thực trình duyệt. Media timer đặt `MEDIA_SSH_PORT=2222`.
+
+## AWS: VM1 2 GB / VM2 8 GB
+
+VM1 chạy stores, API và nginx với `.env.vm1-2gb.example`; VM2 chạy worker đầy đủ
+`docker-compose.worker.yml`, Obscura và dịch vụ ONNX int8 trong `docker-compose.embed.yml`.
+Giữ worker-lite làm phương án dự phòng. Không chạy bước trên VM hoặc tải S3 khi chưa được
+chủ dự án cho phép theo quy định S3 / VM trong `CLAUDE.md`.
+
+- VM1 cần swap 2 GB (`scripts/vm_swap.sh 2048`), VM2 swap 1 GB. Tổng giới hạn VM1
+  là 2250m, lớn hơn RAM vật lý; theo dõi OOM và bộ nhớ, nâng VM1 lên 4 GB nếu cần.
+  Qdrant từng đạt 882 MiB, cao hơn cap 800m: phải kiểm tra tải thực tế, không coi
+  cấu hình này đã được chứng minh đủ.
+- Tạo `.env` VM1 từ mẫu, điền địa chỉ private VM2 vào `EMBED_API_BASE`, cấu hình LLM
+  và tạo mật khẩu store bằng `scripts/store_auth.sh init-env`. VM2 dùng `.env.worker.example`,
+  trỏ về VM1; API VM1 phải tới được cổng 8090 của embed trên VM2.
+- Security Group chỉ cho VM2 truy cập cổng store VM1 (5432, 6379, 6333, 6334),
+  chỉ cho VM1 truy cập 8090 VM2; giới hạn SSH theo nguồn tin cậy và mở 8080 cho người dùng.
+- Media sync: VM1 đặt `API_LOCAL_STORE=./_local_store`; VM2 đặt
+  `WORKER_LOCAL_STORE=./_local_store`, tạo thư mục có quyền ghi cho UID 10000.
+  Đặt `AWS_PROFILE=` trên cả hai VM để dùng local store khi không có AWS keys. Timer
+  dùng `MEDIA_SSH_USER=ubuntu`, `MEDIA_API_HOST`, `MEDIA_SYNC_KEY`, `MEDIA_SOURCE`
+  và `MEDIA_DESTINATION`; kiểm SSH host key và ảnh bài mới sau khi crawl.
+- Trước CD, cập nhật host/key AWS và biến GitHub: bỏ `DEPLOY_RUNNER`,
+  `VM1_SSH_PORT`, `VM2_SSH_PORT`; đặt `VM_SSH_USER=ubuntu`,
+  `WORKER_COMPOSE=docker-compose.worker.yml`. Không đưa secret lên dòng lệnh.
+- Export/restore và kiểm số lượng theo `docs/deploy_v3.md`; hoàn tất dữ liệu và cấu hình
+  trước CD. Sau triển khai kiểm health, `accept_api.py`, golden eval, media mới,
+  bộ nhớ và OOM trong 24 giờ. Không coi restore đơn thuần là hoàn tất.
