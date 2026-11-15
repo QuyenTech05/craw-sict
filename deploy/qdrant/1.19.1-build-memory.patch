@@ -1,7 +1,7 @@
 diff --git a/Dockerfile b/Dockerfile
-index 74cdb0a..f51d593 100644
+index 74cdb0a..cbd8d31 100644
 --- a/Dockerfile
 +++ b/Dockerfile
 @@ -128 +128 @@ RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
 -    xx-cargo build --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --bin qdrant \
-+    CARGO_BUILD_JOBS=2 xx-cargo rustc --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --bin qdrant -- -C lto=thin -C codegen-units=2 \
++    xx-cargo rustc --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --bin qdrant -- -C lto=thin -C codegen-units=2 \
