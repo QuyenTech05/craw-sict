@@ -68,7 +68,8 @@ skip theo chữ ký `graph:corpus_sig`. Các số này chưa chứng minh graph 
 - VM2 đặt `WORKER_LOCAL_STORE=./_local_store`. Đồng bộ media sang VM1 bằng rsync qua SSH,
   không dùng AWS credentials. `sict-media-sync.timer` gọi `scripts/sync_worker_media.sh`
   mỗi 30 giây với `MEDIA_API_HOST`/`MEDIA_SYNC_KEY` trong `/etc/sict-media-sync.env`.
-  Media có độ trễ tối đa một chu kỳ đồng bộ, cộng thời gian truyền file.
+  File đang được ghi dở có thể được cập nhật ở lượt sau; không xoá file đích.
+  Media có độ trễ bằng chu kỳ đồng bộ, cộng thời gian truyền file và retry.
 - `mem_limit` chỉ chặn RAM container; `memswap_limit` là tổng RAM + swap cho phép.
   Swap phải có thật và LXC phải được host cho phép. Tách tiến trình graph không tự giảm
   lượng RAM mà riêng graph cần. Kiểm OOM và lượt graph thật trước khi nhận chạy ổn.
