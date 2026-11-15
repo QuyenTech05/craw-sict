@@ -14,6 +14,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
+import math
 import sqlite3
 import threading
 import time
@@ -265,7 +267,47 @@ def _post(items: list[dict]) -> list[list[float]]:
     raise EmbedError(f"embedding endpoint lỗi sau {e.api_retries} lần: {last}")
 
 
-def _embed_cached(kind: str, keys: list[bytes], make, batch: int) -> list[list[float] | None]:
+def _hf_gradio_texts(texts: list[str], kind: str) -> list[list[float]]:
+    """Space Gradio: POST nhận event_id, GET SSE nhận vector; token gửi ở cả hai lượt."""
+    import httpx
+    e = get_settings().embedding
+    url = e.hf_space_url.rstrip("/") + "/gradio_api/call/embed"
+    headers = {"Authorization": f"Bearer {e.hf_token}"} if e.hf_token else {}
+    try:
+        r = httpx.post(url, json={"data": [texts, kind, e.dim]}, headers=headers, timeout=e.timeout)
+        r.raise_for_status()
+        body = r.json()
+        event_id = body.get("event_id") if isinstance(body, dict) else None
+        if not event_id or not isinstance(event_id, str) or not event_id.isalnum():
+            raise EmbedError("Space không trả event_id hợp lệ")
+        state = ""
+        deadline = time.monotonic() + e.timeout
+        with httpx.stream("GET", f"{url}/{event_id}", headers=headers, timeout=e.timeout) as stream:
+            stream.raise_for_status()
+            for line in stream.iter_lines():
+                if time.monotonic() > deadline:
+                    raise EmbedError("Space quá thời gian chờ inference")
+                if line.startswith("event:"):
+                    state = line[6:].strip()
+                elif line.startswith("data:") and state in ("complete", "error"):
+                    data = json.loads(line[5:].strip())
+                    result = data[0] if isinstance(data, list) and data else data
+                    if state == "error" or not isinstance(result, dict) or result.get("status") != "success":
+                        message = result.get("message", "inference thất bại") if isinstance(result, dict) else "inference thất bại"
+                        raise EmbedError(f"Space: {message}")
+                    rows = result.get("embeddings")
+                    if not isinstance(rows, list) or len(rows) != len(texts):
+                        raise EmbedError("Space trả sai số vector")
+                    if any(not isinstance(row, list) or len(row) != e.dim or
+                           any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in row) for row in rows):
+                        raise EmbedError("Space trả vector sai kích thước hoặc không hữu hạn")
+                    return [[float(v) for v in row] for row in rows]
+    except (httpx.HTTPError, ValueError, KeyError) as exc:
+        raise EmbedError(f"Space HTTP/SSE lỗi: {type(exc).__name__}") from exc
+    raise EmbedError("Space không gửi sự kiện hoàn tất")
+
+
+def _embed_cached(kind: str, keys: list[bytes], make, batch: int, post=None) -> list[list[float] | None]:
     """Vector theo thứ tự `keys` (khoá nội dung). Chỉ mục chưa có trong cache mới gọi `make(i)` để dựng mục
     gửi đi (ảnh: giải mã + resize + base64 — không tốn cho mục đã cache) rồi gọi endpoint. `make` trả None =
     đầu vào không dùng được → vector None. Cùng nội dung trong một lượt chỉ gửi một lần.
@@ -287,7 +329,7 @@ def _embed_cached(kind: str, keys: list[bytes], make, batch: int) -> list[list[f
         built = [(k, it) for k, i in part if (it := make(i)) is not None]   # dựng mục gửi đi ngay trong luồng
         if not built:
             return {}
-        new = {k: v for (k, _), v in zip(built, _post([it for _, it in built]))}
+        new = {k: v for (k, _), v in zip(built, (post or _post)([it for _, it in built]))}
         _cache_put(new)                   # ghi cache từng lượt: dừng giữa chừng không mất phần đã nhúng
         return new
 
@@ -317,6 +359,13 @@ def prepare_image(data: bytes) -> bytes | None:
 
 def _api_embed_texts(texts: list[str], kind: str) -> list[list[float]]:
     e = get_settings().embedding
+    if e.text_provider == "hf-space":
+        task = "query" if kind == "query" else "document"
+        # Space tự thêm prefix/adapter query; cache riêng theo Space và task.
+        cache_kind = f"hf-space:{e.hf_space_url}:{task}"
+        return _embed_cached(cache_kind, [t.encode() for t in texts], lambda i: {"text": texts[i]},
+                             min(e.api_batch, 32),
+                             post=lambda items: _hf_gradio_texts([it["text"] for it in items], task))
     pre = e.query_prefix if kind == "query" else ""
     return _embed_cached("t", [(pre + t).encode() for t in texts], lambda i: {"text": pre + texts[i]}, e.api_batch)
 

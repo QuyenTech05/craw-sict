@@ -93,6 +93,9 @@ class EmbeddingConfig:
     model: str = "jina-clip-v2"     # EMBED_MODEL
     dim: int = 1024                 # EMBED_DIM; Matryoshka: có thể cắt xuống (64–1024)
     query_prefix: str = "Represent the query for retrieving evidence documents: "
+    text_provider: str = "jina"  # jina | hf-space, chỉ áp dụng cho văn bản
+    hf_space_url: str = "https://quyendzvaio-sict.hf.space"
+    hf_token: str = ""
     api_batch: int = 32             # số chữ mỗi lượt gọi
     api_image_batch: int = 8        # số ảnh mỗi lượt gọi (ảnh nặng token)
     api_retries: int = 8
@@ -113,6 +116,8 @@ class EmbeddingConfig:
         alt = {"api_base": "BASEURL_EMBEDDING", "api_key": "APIKEY_EMBEDDING_MODEL", "model": "EMBEDDING_MODEL"}
         for env, attr in (("EMBED_BACKEND", "backend"), ("EMBED_API_BASE", "api_base"),
                           ("EMBED_API_KEY", "api_key"), ("EMBED_MODEL", "model"),
+                          ("EMBED_TEXT_PROVIDER", "text_provider"), ("HF_SPACE_URL", "hf_space_url"),
+                          ("HF_TOKEN", "hf_token"),
                           ("EMBED_DIM", "dim"), ("EMBED_CACHE_PATH", "cache_path"), ("EMBED_TPM", "api_tpm"),
                           ("EMBED_WORKERS", "api_workers"), ("EMBED_IMAGE_BATCH", "api_image_batch"),
                           ("EMBED_QUERY_IMAGE_SIZE", "query_image_size")):
@@ -125,6 +130,9 @@ class EmbeddingConfig:
         if "://" in self.model:
             m = re.search(r"[?&]model=([^&#]+)", self.model)
             self.model = m.group(1) if m else "jina-clip-v2"
+        self.text_provider = self.text_provider.lower()
+        if self.text_provider not in ("jina", "hf-space"):
+            raise ValueError(f"embedding.text_provider không hợp lệ: {self.text_provider!r}")
         self.backend = self.backend.lower()
         if self.backend not in ("torch", "api"):
             raise ValueError(f"embedding.backend không hợp lệ: {self.backend!r} (torch | api)")
