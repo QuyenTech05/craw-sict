@@ -8,10 +8,12 @@ if [ ! -d "$work/.git" ]; then
   git clone --depth 1 --branch v1.19.1 https://github.com/qdrant/qdrant.git "$work"
 fi
 [ "$(git -C "$work" rev-parse HEAD)" = "$revision" ] || { echo "Sai Qdrant revision" >&2; exit 1; }
-if git -C "$work" apply --unidiff-zero --check "$root/deploy/qdrant/1.19.1-sse.patch"; then
-  git -C "$work" apply --unidiff-zero "$root/deploy/qdrant/1.19.1-sse.patch"
-elif ! git -C "$work" apply --unidiff-zero --reverse --check "$root/deploy/qdrant/1.19.1-sse.patch"; then
-  echo "Patch không khớp source" >&2; exit 1
-fi
+for patch in "$root/deploy/qdrant/1.19.1-sse.patch" "$root/deploy/qdrant/1.19.1-build-memory.patch"; do
+  if git -C "$work" apply --unidiff-zero --check "$patch"; then
+    git -C "$work" apply --unidiff-zero "$patch"
+  elif ! git -C "$work" apply --unidiff-zero --reverse --check "$patch"; then
+    echo "Patch không khớp source: $patch" >&2; exit 1
+  fi
+done
 docker build --build-arg TARGET_CPU=x86-64-v2 --build-arg GIT_COMMIT_ID="$revision" \
   -t sict-qdrant:1.19.1-sse-compatible "$work"
