@@ -298,6 +298,10 @@ def _hf_gradio_request(payload: dict, kind: str, expected: int) -> list[list[flo
                     if state == "error" or not isinstance(result, dict) or result.get("status") != "success":
                         message = result.get("message", "inference thất bại") if isinstance(result, dict) else "inference thất bại"
                         raise EmbedError(f"Space: {message}")
+                    reported_model = result.get("model")
+                    expected_model = getattr(e, "model", "")
+                    if reported_model and expected_model and str(reported_model).split("/")[-1] != expected_model.split("/")[-1]:
+                        raise EmbedError("Space trả vector từ model không khớp cấu hình")
                     rows = result.get("embeddings")
                     if not isinstance(rows, list) or len(rows) != expected:
                         raise EmbedError("Space trả sai số vector")

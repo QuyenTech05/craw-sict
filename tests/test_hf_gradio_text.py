@@ -143,3 +143,14 @@ def test_owner_embedding_environment_aliases(monkeypatch):
     assert (e.hf_space_url, e.hf_endpoint, e.dim, e.model) == (
         'https://example.test', '/gradio_api/call/embed', 1024, 'jinaai/jina-clip-v2')
     assert (e.backend, e.text_provider, e.image_provider) == ('api', 'hf-space', 'hf-space')
+
+
+def test_space_rejects_wrong_model(monkeypatch):
+    import httpx
+    config = SimpleNamespace(hf_space_url='https://example.test', hf_token='', dim=3, timeout=20, model='jina-clip-v2')
+    monkeypatch.setattr(E, 'get_settings', lambda: SimpleNamespace(embedding=config))
+    monkeypatch.setattr(httpx, 'post', lambda *a, **k: Response({'event_id':'abc'}))
+    monkeypatch.setattr(httpx, 'stream', lambda *a, **k: Response(lines=['event: complete',
+        'data: '+json.dumps([{'status':'success','model':'other-model','embeddings':[[1,2,3]]}]),'']))
+    with pytest.raises(E.EmbedError, match='model'):
+        E._hf_gradio_texts(['văn bản'], 'document')
