@@ -8,11 +8,30 @@ tách chữ, bảng, ảnh, keyframe video, file đính kèm → PostgreSQL + Qd
 Hỏi được bằng chữ, bằng ảnh, hoặc cả hai; câu trả lời có trích dẫn `[n]` trỏ về bài viết / file
 (kèm số trang) và ảnh, video liên quan khi câu hỏi cần.
 
+**Bản chạy thật:** <http://mmsict.linkpc.net> — API + giao diện chat (hai VM EC2, Docker + GitHub
+Actions CI/CD).
+
 > Dự án đang ở giai đoạn production hardening. Mọi quyết định thiết kế (D1–D33), lộ trình và cách
 > verify/rollback nằm ở [`plan.md`](plan.md); tiêu chí nghiệm thu ở `tests/acceptance_*.md`.
 > [`CLAUDE.md`](CLAUDE.md) là tài liệu kỹ thuật chi tiết nhất về từng thành phần.
 > Kiến trúc router 4 phase (middleware → shadow LLM → hybrid → LangGraph) xem
 > [`PLAN.md`](PLAN.md); hiện trạng đo lường ở [`eval/RESULTS.md`](eval/RESULTS.md).
+
+## Tóm tắt kết quả
+
+- **Pipeline dữ liệu** — crawl BFS trên Redis và index tăng dần tự động mỗi 12 giờ: phát hiện bài
+  mới / bài sửa bằng hash nội dung đã làm sạch, reconcile PostgreSQL ↔ Qdrant hằng đêm để không xử
+  lý lại và không để điểm mồ côi.
+- **Xử lý đa phương thức** — chunk theo cấu trúc DOM, OCR tiếng Việt (Tesseract) cho ảnh và PDF scan,
+  keyframe video bằng FFmpeg: nội dung trang, ảnh và video đều tìm được.
+- **Truy xuất lai** — Jina CLIP v2 + BM25 trên chữ bỏ dấu + graph khái niệm, gộp bằng RRF, lọc theo
+  bằng chứng; **media precision 0,674 → 0,798**.
+- **Tối ưu mô hình** — tự host Jina CLIP v2 với lượng tử hóa ONNX INT8, giảm kích thước ảnh truy vấn
+  xuống 336 px: **độ trễ mỗi ảnh 9,6 s → 4,3 s trên 2 vCPU / 8 GB** (vector gần như không đổi: cosine
+  0,999 chữ, 1,000 ảnh so với fp32).
+- **Đánh giá và triển khai** — RAGAS trên 88 câu golden: **faithfulness 0,914 · answer relevancy
+  0,730 · context precision 0,724 · context recall 0,886**, URL hit **92,3 %**; chạy trên hai VM EC2
+  bằng Docker Compose và GitHub Actions CI/CD.
 
 ## Tính năng
 
@@ -209,9 +228,13 @@ chưa đạt) ở `eval/RESULTS.md` và `eval/results/`; điểm RAGAS từng l�
 
 ## Triển khai
 
+Bản chạy thật: **<http://mmsict.linkpc.net>** (nginx :80 / :8080 trên VM1 → API :8003).
+
 Hai VM, Docker Compose (không k8s, D15):
 
 - **VM1** (2 vCPU / 4 GB) `docker-compose.yml`: postgres, redis, qdrant, api (cổng 8003), nginx cache (8080).
+  nginx cho phép body tới 16 MB vì ảnh truy vấn đi trong JSON dạng base64 (ảnh 1,5 MB → request ~2 MB;
+  mặc định 1 m của nginx trả 413).
 - **VM2** (EC2 riêng 2 vCPU / 8 GB, D32) `docker-compose.worker.yml`: `cron` chạy incremental mỗi 12 giờ, tối đa
   5 phút / lượt (D31), Obscura sidecar (`svc-ocr` chỉ chạy tay); dịch vụ embedding `docker-compose.embed.yml`. Trỏ về VM1 qua `.env` (`.env.worker.example`).
 - **Index v3 trên production**: API (VM1) và `cron` (VM2) đọc cùng bộ biến từ `.env` (`EMBED_BACKEND=api`,
