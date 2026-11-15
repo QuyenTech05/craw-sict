@@ -191,6 +191,8 @@ jobs:
             case "$compose_file" in docker-compose.worker.yml|docker-compose.worker-lite.yml) ;; *) exit 2 ;; esac
             docker compose -f "$compose_file" pull cron
             docker logout ghcr.io
+            # Named volume mới thuộc root; app uid 10000 cần ghi cache embedding/underthesea.
+            docker compose -f "$compose_file" run --rm --no-deps --user 0 cron sh -c 'mkdir -p /cache/hf; chown 10000:10000 /cache/hf'
             if [ "$compose_file" = docker-compose.worker-lite.yml ]; then
               docker compose -f "$compose_file" up -d cron
             else
