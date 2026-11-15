@@ -73,3 +73,14 @@ def test_provider_and_task_have_separate_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(E, '_post', lambda items: jina_calls.append(items) or [[2.0] * e.dim for _ in items])
     assert E.embed_texts(['cùng nội dung'], kind='passage')[0][0] == 2.0
     assert len(jina_calls) == 1
+
+
+def test_space_rejects_wrong_dimensions(monkeypatch):
+    import httpx
+    config = SimpleNamespace(hf_space_url='https://example.test', hf_token='', dim=3, timeout=20)
+    monkeypatch.setattr(E, 'get_settings', lambda: SimpleNamespace(embedding=config))
+    monkeypatch.setattr(httpx, 'post', lambda *a, **k: Response({'event_id':'abc'}))
+    monkeypatch.setattr(httpx, 'stream', lambda *a, **k: Response(lines=['event: complete',
+        'data: '+json.dumps([{'status':'success','embeddings':[[1,2]]}]),'']))
+    with pytest.raises(E.EmbedError, match='kích thước'):
+        E._hf_gradio_texts(['văn bản'], 'document')
