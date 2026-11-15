@@ -99,3 +99,47 @@ def test_image_uses_unified_typed_endpoint(monkeypatch):
         'data: '+json.dumps([{'status':'success','embeddings':[[1,2,3]]}]),'']))
     assert E._hf_gradio_image('ZmFrZQ==') == [1.0, 2.0, 3.0]
     assert calls[0]['data'] == [{'type':'image','input':'ZmFrZQ=='}, 'query', 3]
+
+
+def test_image_provider_routes_and_caches_separately(tmp_path, monkeypatch):
+    import base64
+    import io
+    from PIL import Image
+    from sict_crawler.core.config import get_settings
+    e = get_settings().embedding
+    monkeypatch.setattr(e, 'backend', 'api')
+    monkeypatch.setattr(e, 'image_provider', 'hf-space')
+    monkeypatch.setattr(e, 'cache_path', str(tmp_path / 'image-cache.sqlite'))
+    monkeypatch.setattr(E, '_cache_db', None)
+    calls = []
+    def fake_image(b64):
+        with Image.open(io.BytesIO(base64.b64decode(b64))) as image:
+            assert image.format == 'JPEG'
+        calls.append(b64)
+        return [1.0] * e.dim
+    monkeypatch.setattr(E, '_hf_gradio_image', fake_image)
+    buf = io.BytesIO()
+    Image.new('RGB', (10, 10)).save(buf, format='PNG')
+    raw = buf.getvalue()
+    assert E.embed_image_bytes([raw, b'bad'])[1] == [0]
+    assert E.embed_image_bytes([raw])[0][0][0] == 1.0
+    assert len(calls) == 1
+    monkeypatch.setattr(e, 'image_provider', 'jina')
+    other = []
+    monkeypatch.setattr(E, '_post', lambda items: other.append(items) or [[2.0] * e.dim for _ in items])
+    assert E.embed_image_bytes([raw])[0][0][0] == 2.0
+    assert len(other) == 1
+
+
+def test_owner_embedding_environment_aliases(monkeypatch):
+    from sict_crawler.core.config import EmbeddingConfig
+    for name in ('HF_SPACE_URL', 'HF_SPACE_ENDPOINT', 'EMBED_DIM', 'EMBED_MODEL', 'EMBED_BACKEND', 'EMBED_TEXT_PROVIDER', 'EMBED_IMAGE_PROVIDER'):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv('EMBEDDING_BASE_URL', 'https://example.test')
+    monkeypatch.setenv('EMBEDDING_ENDPOINT', '/gradio_api/call/embed')
+    monkeypatch.setenv('EMBEDDING_DIMENSION', '1024')
+    monkeypatch.setenv('EMBEDDING_MODEL', 'jinaai/jina-clip-v2')
+    e = EmbeddingConfig()
+    assert (e.hf_space_url, e.hf_endpoint, e.dim, e.model) == (
+        'https://example.test', '/gradio_api/call/embed', 1024, 'jinaai/jina-clip-v2')
+    assert (e.backend, e.text_provider, e.image_provider) == ('api', 'hf-space', 'hf-space')

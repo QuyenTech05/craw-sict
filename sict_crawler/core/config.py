@@ -96,6 +96,7 @@ class EmbeddingConfig:
     text_provider: str = "jina"  # jina | hf-space
     image_provider: str = "jina"  # jina | hf-space
     hf_space_url: str = "https://quyendzvaio-sict.hf.space"
+    hf_endpoint: str = "/gradio_api/call/embed"
     hf_token: str = ""
     api_batch: int = 32             # số chữ mỗi lượt gọi
     api_image_batch: int = 8        # số ảnh mỗi lượt gọi (ảnh nặng token)
@@ -114,11 +115,12 @@ class EmbeddingConfig:
             self.device = os.environ["EMBED_DEVICE"].strip().lower()
         # tên biến chủ dự án đặt trong .env (BASEURL_EMBEDDING / APIKEY_EMBEDDING_MODEL / EMBEDDING_MODEL) dùng
         # làm dự phòng khi không có EMBED_*
-        alt = {"api_base": "BASEURL_EMBEDDING", "api_key": "APIKEY_EMBEDDING_MODEL", "model": "EMBEDDING_MODEL"}
+        alt = {"api_base": "BASEURL_EMBEDDING", "api_key": "APIKEY_EMBEDDING_MODEL", "model": "EMBEDDING_MODEL",
+               "dim": "EMBEDDING_DIMENSION", "hf_space_url": "EMBEDDING_BASE_URL", "hf_endpoint": "EMBEDDING_ENDPOINT"}
         for env, attr in (("EMBED_BACKEND", "backend"), ("EMBED_API_BASE", "api_base"),
                           ("EMBED_API_KEY", "api_key"), ("EMBED_MODEL", "model"),
                           ("EMBED_TEXT_PROVIDER", "text_provider"), ("EMBED_IMAGE_PROVIDER", "image_provider"),
-                          ("HF_SPACE_URL", "hf_space_url"),
+                          ("HF_SPACE_URL", "hf_space_url"), ("HF_SPACE_ENDPOINT", "hf_endpoint"),
                           ("HF_TOKEN", "hf_token"),
                           ("EMBED_DIM", "dim"), ("EMBED_CACHE_PATH", "cache_path"), ("EMBED_TPM", "api_tpm"),
                           ("EMBED_WORKERS", "api_workers"), ("EMBED_IMAGE_BATCH", "api_image_batch"),
@@ -132,6 +134,14 @@ class EmbeddingConfig:
         if "://" in self.model:
             m = re.search(r"[?&]model=([^&#]+)", self.model)
             self.model = m.group(1) if m else "jina-clip-v2"
+        # Bộ biến EMBEDDING_* là cấu hình Space do người vận hành cung cấp.
+        if os.environ.get("EMBEDDING_BASE_URL"):
+            if not os.environ.get("EMBED_BACKEND"):
+                self.backend = "api"
+            if not os.environ.get("EMBED_TEXT_PROVIDER"):
+                self.text_provider = "hf-space"
+            if not os.environ.get("EMBED_IMAGE_PROVIDER"):
+                self.image_provider = "hf-space"
         self.text_provider = self.text_provider.lower()
         if self.text_provider not in ("jina", "hf-space"):
             raise ValueError(f"embedding.text_provider không hợp lệ: {self.text_provider!r}")

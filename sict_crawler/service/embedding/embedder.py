@@ -271,7 +271,10 @@ def _hf_gradio_request(payload: dict, kind: str, expected: int) -> list[list[flo
     """Space Gradio: POST nhận event_id, GET SSE nhận vector; token gửi ở cả hai lượt."""
     import httpx
     e = get_settings().embedding
-    url = e.hf_space_url.rstrip("/") + "/gradio_api/call/embed"
+    endpoint = getattr(e, "hf_endpoint", "/gradio_api/call/embed")
+    if not endpoint.startswith("/") or endpoint.startswith("//") or "?" in endpoint or "#" in endpoint:
+        raise EmbedError("Space endpoint không hợp lệ")
+    url = e.hf_space_url.rstrip("/") + endpoint
     headers = {"Authorization": f"Bearer {e.hf_token}"} if e.hf_token else {}
     try:
         r = httpx.post(url, json={"data": [payload, kind, e.dim]}, headers=headers, timeout=e.timeout)
@@ -371,7 +374,7 @@ def _api_embed_texts(texts: list[str], kind: str) -> list[list[float]]:
     if e.text_provider == "hf-space":
         task = "query" if kind == "query" else "document"
         # Space tự thêm prefix/adapter query; cache riêng theo Space và task.
-        cache_kind = f"hf-space:{e.hf_space_url}:{task}"
+        cache_kind = f"hf-space:{e.hf_space_url}:{e.hf_endpoint}:{task}"
         return _embed_cached(cache_kind, [t.encode() for t in texts], lambda i: {"text": texts[i]},
                              min(e.api_batch, 32),
                              post=lambda items: _hf_gradio_texts([it["text"] for it in items], task))
@@ -393,7 +396,7 @@ def _api_embed_image_bytes(images: list[bytes], query_size: int = 0) -> tuple[li
     kind = f"iq{query_size}" if query_size else f"i{IMAGE_MAX_SIDE}"
     if e.image_provider == "hf-space":
         # Space nhận một ảnh mỗi lượt, tự tiền xử lý ảnh; cache tách khỏi backend Jina.
-        kind = f"hf-space:{e.hf_space_url}:{kind}"
+        kind = f"hf-space:{e.hf_space_url}:{e.hf_endpoint}:{kind}"
         vecs = _embed_cached(kind, [hashlib.sha256(b).digest() for b in images], make, 1,
                              post=lambda items: [_hf_gradio_image(it["image"]) for it in items])
     else:
