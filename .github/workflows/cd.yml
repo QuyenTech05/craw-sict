@@ -104,7 +104,7 @@ jobs:
           port: ${{ vars.VM1_SSH_PORT || 22 }}
           username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
           key: ${{ secrets.VM1_KEY }}
-          source: docker-compose.yml,docker-compose.small.yml,config.yaml,nginx/nginx.conf,scripts/monitor_2vm.sh,scripts/store_auth.sh
+          source: docker-compose.yml,docker-compose.small.yml,config.yaml,nginx/nginx.conf,nginx/sict-http.conf,scripts/monitor_2vm.sh,scripts/store_auth.sh
           target: ~/craw-sict
       - name: Pull + up (infra, api, nginx)
         uses: appleboy/ssh-action@v1
@@ -143,6 +143,22 @@ jobs:
             for i in $(seq 1 30); do curl -sf -m 10 http://localhost:8003/app.js -o /dev/null && break; sleep 10; done
             curl -sf -m 10 http://localhost:8003/app.js -o /dev/null
             curl -sf -m 10 http://localhost:8080/nginx-health -o /dev/null || echo "cảnh báo: nginx-health không trả lời"
+            # Cửa 1 (host nginx, TLS + redirect) — chỉ đụng khi máy đã cài file này và nội dung khác repo.
+            # client_max_body_size của khối 80 là thứ CD không thể bỏ qua: thiếu nó thì POST ảnh lớn nhận 413.
+            if sudo -n test -f /etc/nginx/conf.d/sict-http.conf 2>/dev/null; then
+              if ! sudo -n diff -q nginx/sict-http.conf /etc/nginx/conf.d/sict-http.conf >/dev/null 2>&1; then
+                back=/etc/nginx/conf.d/sict-http.conf.bak-cd
+                sudo -n cp /etc/nginx/conf.d/sict-http.conf "$back"
+                sudo -n cp nginx/sict-http.conf /etc/nginx/conf.d/sict-http.conf
+                if sudo -n nginx -t 2>/dev/null; then
+                  sudo -n systemctl reload nginx
+                  echo "đã cập nhật host nginx (sict-http.conf)"
+                else
+                  sudo -n cp "$back" /etc/nginx/conf.d/sict-http.conf
+                  echo "BLOCKER: sict-http.conf mới sai cú pháp — đã khôi phục bản cũ" >&2; exit 1
+                fi
+              fi
+            fi
             docker compose ps --format 'table {{.Name}}\t{{.Image}}\t{{.Status}}'
 
   deploy-vm2:
