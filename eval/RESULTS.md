@@ -513,3 +513,41 @@ chấm, không xác định được ý nghĩa thống kê. Kiểm tra thủ cô
 ngữ cảnh và URL giống hệt giữa hai nhánh, nhưng một số câu trả lời có suy diễn hoặc
 đếm sai. Không quy các lỗi đó cho việc thay route khi chưa có bằng chứng. Các câu
 trả lời và log đánh giá chi tiết nằm ngoài repo tại `/DATA/tmp/sict-ragas-2026-11-08/`.
+
+## 2026-11-21 — GĐ1 dev, golden đa phương thức 150 câu (draft)
+
+Bộ `eval/multimodal_v1.jsonl`: 150 câu, gồm 50 input ảnh thật; file chưa được track,
+SHA-256 `88420ea48c9caa46b82876d6aebd3ce30258e5f238ff5c2daff2ea6d02bc66f6`.
+Collector hỗ trợ ảnh nằm ngoài repo tại `/DATA/craw-sict-data/gd1-dev-check/collect150.py`;
+đáp án và điểm từng câu cũng nằm ngoài repo trong thư mục đó. API dev dùng index v3,
+Jina-CLIP-v2 ONNX W8 (trọng số INT8), GPT-OSS `gpt-oss-120b-sale`; giám khảo
+`deepseek-v4-flash-sale`, embedding RAGAS cùng dịch vụ INT8. Tắt query cache và prompt cache.
+`/query` và `/chat` chạy riêng; ngữ cảnh chấm lấy từ `/query`, nên không chứng minh hai lượt
+truy xuất riêng có context byte-identical. Giám khảo chỉ nhận câu chữ, câu trả lời và context,
+không nhận ảnh gốc.
+
+Thu thập đầu: 150 yêu cầu, 3 fallback và 1 HTTP 500 (Qdrant gRPC); 4 câu đó đã chạy lại thành
+công và được dùng để chấm bổ sung. Ba câu ngoài phạm vi được kiểm tra từ chối (3/3), không áp dụng
+bốn chỉ số RAGAS. Với 14 câu ảnh-only, dùng câu hỏi mặc định mà API gửi LLM; điểm nhóm này là
+đánh giá qua văn bản, không đo giám khảo hiểu ảnh. Bộ golden và ảnh đang là dữ liệu local draft.
+
+| Chỉ số | Trung bình | Điểm hợp lệ / câu có đáp án |
+|---|---:|---:|
+| Faithfulness | 0,8342 | 133/147 |
+| Answer relevancy | 0,6581 | 147/147 |
+| Context precision | 0,7009 | 147/147 |
+| Context recall | 0,6521 | 126/147 |
+
+14 điểm faithfulness còn thiếu sau khi thử lại do `IncompleteOutputException` ở giới hạn output
+8.192 token; 21 câu có đáp án thiếu reference nên không áp dụng context recall. Điểm là tập hợp
+lượt chấm ban đầu (4.096 output token) và các chỉ số lỗi chạy lại (8.192); không coi là một lượt
+chấm đồng nhất hoặc thay thế đánh giá ảnh trực tiếp. Không so trực tiếp với các lượt khác model,
+judge, tập câu hỏi hay cache.
+
+Độ trễ lượt đầu, tính cả fallback: `/chat` p50 5,32 s, p95 20,18 s (149 lượt có thời gian),
+TTFT p50 4,48 s, p95 17,65 s; `/query` p50 1,28 s, p95 13,51 s. Phân vị p95 dùng vị trí
+`floor(0,95 × (n−1))`. Không đưa 4 lượt chạy lại vào latency lượt đầu.
+
+Sau lượt đo có sửa nhánh embedding `torch` để báo lỗi ảnh nhất quán; nhánh `api` v3 dùng trong
+phép đo giữ cùng hành vi. Acceptance dev trước đó 59/60, `g004` không tìm được URL kỳ vọng trên
+cả code gốc lẫn GĐ1; các check chat trong acceptance đó đã fallback và cần đo lại với LLM thật.

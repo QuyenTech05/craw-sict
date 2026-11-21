@@ -31,7 +31,7 @@ def index_tag() -> str:
 
 def query_cache_key(question: str, top_k: int, filters_key: str = "", index: str | None = None) -> str:
     index = index_tag() if index is None else index
-    return "q:v13:" + hashlib.sha256(   # v13: route ảnh đầu vào và yêu cầu tệp; v12: media theo bằng chứng (ảnh của bài chữ đứng đầu, video, sufficient); v11: nhánh cụm tên riêng; v10: graph khái niệm D33 (bỏ [graph], ảnh theo người); v9: đoạn đủ dài, đoạn liền kề câu liệt kê, khôi phục dấu; v8: phạm vi mục + năm nhãn bảng + tiêu đề; v7: bảng mang nhãn; v6: D30
+    return "q:v14:" + hashlib.sha256(   # v14: không tái sử dụng cache trước khi ghi trạng thái ảnh
         f"{question}\x00{top_k}\x00{filters_key}\x00{index}".encode()).hexdigest()
 
 
@@ -303,7 +303,7 @@ def retrieve(question: str, top_k: int = 5,
         except Exception:
             pass
     # ảnh truy vấn (CPU, ~4 s ở 336 px) nhúng trong lúc phần chữ chạy (luật viết tắt, graph, nhúng câu hỏi)
-    ifut = _STAGE_POOL.submit(_query_image_vec, query_image_b64) if unified and query_image_b64 else None
+    ifut = _STAGE_POOL.submit(_query_image_vec, query_image_b64) if query_image_b64 else None
     if has_text:
         r = query_rewriter.rewrite(question, allow_llm=False) if route_override is not None else query_rewriter.rewrite(question)
         route = route_override or router.decide(question, r.get("route_llm"), has_image=bool(query_image_b64))
@@ -337,9 +337,10 @@ def retrieve(question: str, top_k: int = 5,
         alt = [(rvec, r["rewritten"])]
     terms = list(dict.fromkeys(query_rewriter._terms(q0) + r["terms"])) if has_text else []
     ivec = ifut.result() if ifut is not None else None
-    if query_image_b64 and ivec is None and not has_text:
-        return [], [], router.Route(media="none", source="image", inputs=["image"])   # ảnh hỏng, không có chữ
-    extra = [("i2t", ivec)] if ivec is not None else []
+    route.image_status = ('ok' if ivec is not None else 'embedding_failed') if query_image_b64 else 'none'
+    if query_image_b64 and ivec is None and not question.strip():
+        return [], [], router.Route(media="none", source="image", inputs=["image"], image_status='embedding_failed')
+    extra = [("i2t", ivec)] if unified and ivec is not None else []
     # nhánh media không cần kết quả chữ để TÌM (chỉ cần khi chặn bằng router.gate) → chạy song song với nhánh chữ
     mfut = None
     # số media tối đa theo ý định (router.media_cap): `none` = rc.none_max (mặc định 0 → không chạy nhánh media)
@@ -356,8 +357,8 @@ def retrieve(question: str, top_k: int = 5,
         else:
             img_query_vecs = [embedder.embed_text_clip([r["rewritten"]])[0]]
             image_vecs = []
-            if (qvec := _query_image_vec(query_image_b64)) is not None:
-                img_query_vecs.append(qvec)
+            if ivec is not None:
+                img_query_vecs.append(ivec)
         # ý định `none` (none_max > 0): chỉ ảnh của bài chữ đứng đầu (_doc_media), không tìm toàn collection
         if route.media != "none":
             mfut = _STAGE_POOL.submit(_media_candidates, img_query_vecs, r["terms"], max(top_k, 10), f,
@@ -400,7 +401,7 @@ def retrieve(question: str, top_k: int = 5,
     msrcs = media_sources([_as_media(h) for h in kept])
 
     # U4: ảnh giống ảnh người dùng gửi nằm trong bài nào → lấy đoạn gần ảnh nhất của bài đó làm ngữ cảnh
-    if ivec is not None:
+    if unified and ivec is not None:
         linked = _linked_doc_hits(ivec, kept, qf)
         # có chữ kèm ảnh ("ảnh này là sự kiện gì?"): đoạn của bài chứa ảnh khớp NHẤT lên đầu, bài của các ảnh giống
         # kém hơn xếp sau kết quả chữ (ảnh sự kiện khác nhau cũng giống nhau ~0,9, dễ kéo nhầm bài)
@@ -411,7 +412,7 @@ def retrieve(question: str, top_k: int = 5,
     tsrcs = text_sources(text_hits[:k] + extra)
     route.inputs = [x for x, on in (("text", bool(question.strip())), ("image", bool(query_image_b64))) if on]
     route.outputs = [x for x, on in (("text", bool(tsrcs)), ("image", bool(msrcs))) if on]
-    if route_override is None:
+    if route_override is None and route.image_status != 'embedding_failed':
         cache.put(ck, json.dumps({
             "text": [s.model_dump() for s in tsrcs],
             "media": [s.model_dump() for s in msrcs],

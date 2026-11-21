@@ -82,6 +82,7 @@ class Route:
     list_question: bool = False                         # D27: câu hỏi liệt kê (is_list_question) → truy xuất rộng
     wants_video: bool = False                           # câu nêu "video"/"clip" → gate xếp video trước
     oos: bool = False                                   # ngoài phạm vi, chỉ hybrid đề xuất
+    image_status: str = 'none'
 
     def to_dict(self) -> dict:
         return asdict(self)

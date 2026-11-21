@@ -69,7 +69,7 @@ async def query(q: QueryIn):
     # agent.run đồng bộ (Qdrant, embed, LLM): gọi thẳng trong handler async thì chặn event loop → mọi request
     # (cả /metrics của Alloy) xếp hàng tuần tự; tải 4 luồng 2026-10-21: p50 0,4 → 1,6 s, scrape /metrics 30 s, up=0
     res = await run_in_threadpool(_agent.run, q.question, q.top_k, q.image, q.filters)
-    return {"answer": None, "context": res["context"],
+    return {"answer": None, "context": res["context"], "image_status": res.get("image_status", "none"),
             "media_mode": res.get("media_mode"), "wants_file": res.get("wants_file"),
             "media_note": res.get("media_note"), "list_question": res.get("list_question"),
             "entities": res.get("entities"),
@@ -98,7 +98,12 @@ async def chat(q: QueryIn):
                    "câu trả lời có thể chưa đầy đủ.)\n\n" + context)
 
     async def gen():
-        yield f"data: {json.dumps({'status': {'attempts': res['attempts'], 'sufficient': res['sufficient'], 'media_mode': res.get('media_mode'), 'wants_file': res.get('wants_file'), 'media_note': res.get('media_note'), 'list_question': res.get('list_question'), 'entities': res.get('entities'), 'inputs': res.get('inputs'), 'outputs': res.get('outputs')}})}\n\n"
+        if q.image and not q.question.strip() and res.get('image_status') == 'embedding_failed':
+            yield f"data: {json.dumps({'status': {'image_status': 'embedding_failed'}})}\n\n"
+            yield f"data: {json.dumps({'delta': 'Không xử lý được ảnh đính kèm (dịch vụ embedding lỗi). Vui lòng thử lại.'})}\n\n"
+            yield 'data: [DONE]\n\n'
+            return
+        yield f"data: {json.dumps({'status': {'attempts': res['attempts'], 'sufficient': res['sufficient'], 'media_mode': res.get('media_mode'), 'wants_file': res.get('wants_file'), 'media_note': res.get('media_note'), 'list_question': res.get('list_question'), 'entities': res.get('entities'), 'inputs': res.get('inputs'), 'outputs': res.get('outputs'), 'image_status': res.get('image_status', 'none')}})}\n\n"
         yield f"data: {json.dumps({'text': [s.model_dump(exclude=RESPONSE_EXCLUDE) for s in tsrcs], 'media': [s.model_dump(exclude=RESPONSE_EXCLUDE) for s in msrcs]})}\n\n"
         if res.get("oos"):
             yield f"data: {json.dumps({'delta': 'Câu hỏi nằm ngoài phạm vi thông tin của SICT.'})}\n\n"
@@ -112,6 +117,7 @@ async def chat(q: QueryIn):
         streamed: list[str] = []
         q_out: queue.Queue = queue.Queue()
         SENTINEL = object()
+        generation = {}
 
         def worker():
             """vlm.stream_answer is a sync generator doing blocking HTTP."""
@@ -119,7 +125,7 @@ async def chat(q: QueryIn):
                 # T2 prompt cache (spec: docs/prompt_caching_multi_tier.md): hit → stream lại từ
                 # cache, không gọi LLM. Default tắt; mọi key chứa đủ model/context/index.
                 from sict_crawler.service.retrieval.prompt_cache import stream_answer_cached
-                gen = stream_answer_cached(q.question.strip() or IMAGE_ONLY_QUESTION, context, q.image)
+                gen = stream_answer_cached(q.question.strip() or IMAGE_ONLY_QUESTION, context, q.image, state=generation)
                 for chunk in gen:
                     q_out.put(chunk)
             finally:
@@ -145,6 +151,8 @@ async def chat(q: QueryIn):
         if final != said:
             yield f"data: {json.dumps({'delta': final[len(said):]} if final.startswith(said) else {'answer': final})}\n\n"
         yield f"data: {json.dumps({'citations': cites})}\n\n"
+        if generation.get('finish') != 'done':
+            yield f"data: {json.dumps({'status': {'generation': 'incomplete', 'error_code': generation.get('error_code', 'empty')}})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")

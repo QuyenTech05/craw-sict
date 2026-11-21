@@ -238,7 +238,11 @@ def test_hybrid_chat_graph_streams_status_sources_deltas_and_citations(monkeypat
                  excerpt='Học phí ngành CNTT', content='Học phí ngành CNTT', cosine=.9)
     monkeypatch.setattr(agent, '_retrieve_step', lambda *a, **k: {
         'tsrcs': [src], 'msrcs': [], 'route': a[-1], 'attempts': 1, 'log': []})
-    monkeypatch.setattr(vlm, 'stream_answer', lambda *a: iter(['Học phí ', 'theo thông báo [1].']))
+    def complete(*args, state, **kwargs):
+        yield 'Học phí '
+        state.update(finish='done', error_code=None)
+        yield 'theo thông báo [1].'
+    monkeypatch.setattr(vlm, 'stream_answer', complete)
     events = list(graph.stream_chat('Học phí ngành CNTT?', 5, None, None))
     assert 'status' in events[0] and 'text' in events[1]
     assert ''.join(e.get('delta', '') for e in events).startswith('Học phí theo thông báo [1].')
@@ -271,7 +275,7 @@ def test_hybrid_chat_falls_back_when_graph_raises(monkeypatch):
     monkeypatch.setattr(agent, '_run_linear', lambda *a: {
         'text': [], 'media': [], 'context': '', 'attempts': 1, 'sufficient': False,
         'media_mode': 'none', 'wants_file': False, 'oos': False})
-    monkeypatch.setattr(vlm, 'stream_answer', lambda *a: iter(['Xin chào']))
+    monkeypatch.setattr(vlm, 'stream_answer', lambda *a, **kw: iter(['Xin chào']))
     events = list(graph.stream_chat('Hỏi?', 5, None, None))
     assert events[-1] == {'done': True} and any(e.get('delta') == 'Xin chào' for e in events)
 

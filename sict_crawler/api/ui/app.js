@@ -43,7 +43,9 @@ input.addEventListener('keydown', (ev) => {
 });
 
 function attach(file) {
-  if (!file || !/^image\/(jpeg|png)$/.test(file.type)) return;
+  if (!file) return;
+  if (!/^image\/(jpeg|png)$/.test(file.type)) { alert('Vui lòng chọn ảnh JPEG hoặc PNG.'); return; }
+  if (file.size > 5 * 1024 * 1024) { alert('Ảnh vượt quá giới hạn 5 MB.'); return; }
   const r = new FileReader();
   r.onload = () => {
     pendingUrl = r.result;
@@ -261,7 +263,11 @@ async function ask(q, b64, imgUrl) {
           paint();
         }
         if (obj.status) {
+          if (obj.status.image_status === 'embedding_failed') notes.appendChild(el('div', 'note', 'Không xử lý được ảnh đính kèm. Vui lòng thử lại.'));
           if (phase.isConnected) phaseText.textContent = 'Đang soạn câu trả lời';
+          if (obj.status.generation === 'incomplete') {
+            notes.appendChild(el('div', 'note', 'Câu trả lời chưa hoàn tất. Vui lòng thử lại.'));
+          }
           // router D17: hỏi ảnh mà không có ảnh đạt bằng chứng → ghi chú, không hiện ảnh sai
           if (obj.status.media_note) notes.appendChild(el('div', 'note', obj.status.media_note));
           // D27: bằng chứng chưa đủ (agent.evidence) → báo người đọc câu trả lời có thể thiếu

@@ -110,6 +110,9 @@ def collect(args) -> None:
             with post(args.api, "/query", {"question": q["question"], "top_k": args.top_k,
                                            "filters": q["filters"]}, args.timeout) as r:
                 res = json.loads(r.read())
+            if res.get('image_status') == 'embedding_failed':
+                print(f"{q['id']} bỏ qua: dịch vụ embedding ảnh lỗi", flush=True)
+                break
             t_query = time.time() - t
             t0_chat = time.time()
             ans = chat(args.api, q, args.top_k, args.timeout)
@@ -120,6 +123,8 @@ def collect(args) -> None:
             time.sleep(60)
         else:
             print(f"{q['id']} bỏ qua: LLM không trả lời sau 4 lần", flush=True)
+            continue
+        if res.get('image_status') == 'embedding_failed':
             continue
         contexts = [c for c in res.get("context", "").split(SEP) if c.strip()]
         row = {**q, "answer": ans, "contexts": contexts, "sufficient": res.get("sufficient"),

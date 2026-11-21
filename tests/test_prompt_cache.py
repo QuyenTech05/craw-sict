@@ -39,7 +39,7 @@ def test_route_key_differs_by_router_model(monkeypatch):
     assert k1 != k2
     # router_model rỗng → fallback sang cfg.model (vẫn tạo key hợp lệ, đúng prefix)
     monkeypatch.setattr(llm, "router_model", "")
-    assert pc.route_cache_key("q", "img", "q1").startswith("pc:v1:route:")
+    assert pc.route_cache_key("q", "img", "q1").startswith("pc:v2:route:")
 
 
 def test_route_key_keeps_diacritics():
@@ -83,8 +83,8 @@ def test_prompt_key_differs_by_context():
 
 
 def test_key_format_prefixes():
-    assert pc.route_cache_key("q", "", "k").startswith("pc:v1:route:")
-    assert pc.prompt_cache_key("q", "", "ctx", "idx").startswith("pc:v1:prompt:")
+    assert pc.route_cache_key("q", "", "k").startswith("pc:v2:route:")
+    assert pc.prompt_cache_key("q", "", "ctx", "idx").startswith("pc:v2:prompt:")
 
 
 # ── tắt mặc định ───────────────────────────────────────────────────────────────
@@ -193,9 +193,13 @@ def test_stream_hit_replays_cache_without_llm(cache_on):
 
 
 def test_stream_miss_calls_llm_and_stores(cache_on):
+    def complete(*args, state, **kwargs):
+        yield 'Đáp án '
+        state.update(finish='done', error_code=None)
+        yield 'từ LLM'
     with patch.object(pc, "get_answer", return_value=None), \
          patch("sict_crawler.service.retrieval.vlm.stream_answer",
-               return_value=iter(["Đáp án ", "từ LLM"])) as mock_llm, \
+               side_effect=complete) as mock_llm, \
          patch.object(pc, "put_answer") as mock_put:
         got = list(pc.stream_answer_cached("q", "ctx"))
     assert "".join(got) == "Đáp án từ LLM"

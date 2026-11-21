@@ -430,3 +430,90 @@ def test_list_neighbors_add_adjacent_chunks_of_top_docs(monkeypatch):
     assert all(h["via"] == "neighbor" for h in extra)
     two = R.list_neighbors(hits + [dict(doc[1][2])], n_docs=1, window=1)   # bài 1 có đoạn 1 và 2 → thêm 0 và 3
     assert [(h["document_id"], h["idx"]) for h in two] == [(1, 0), (1, 3)]
+
+
+def test_stream_answer_reports_truncated_on_disconnect(monkeypatch):
+    import json
+    from sict_crawler.service.retrieval import vlm
+    class Response:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def iter_lines(self):
+            yield 'data: ' + json.dumps({'choices': [{'delta': {'content': 'Câu chưa xong'}}]})
+            raise ConnectionError('mất kết nối')
+    class Client:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def stream(self, *args, **kwargs): return Response()
+    monkeypatch.setattr(get_settings().llm, 'api_key', 'k')
+    monkeypatch.setattr(vlm, '_client', lambda *args, **kwargs: Client())
+    state = {}
+    assert list(vlm.stream_answer('q', 'ctx', state=state)) == ['Câu chưa xong']
+    assert state['finish'] == 'truncated'
+    assert state['error_code'] == 'network'
+
+
+def test_query_input_rejects_invalid_payloads():
+    from pydantic import ValidationError
+    from sict_crawler.model.schemas import QueryIn
+    import pytest
+    for data in ({'question': '  '}, {'question': 'x', 'top_k': 31},
+                 {'question': 'x', 'image': 'aaa='}, {'question': 'x', 'filters': {'unknown': 1}}):
+        with pytest.raises(ValidationError):
+            QueryIn(**data)
+    assert QueryIn(question='  hợp lệ  ').question == 'hợp lệ'
+
+
+def test_image_embedding_failure_is_reported_and_not_cached(monkeypatch):
+    from sict_crawler.service.retrieval import retriever
+    monkeypatch.setattr(retriever.embedder, 'backend', lambda: 'api')
+    monkeypatch.setattr(retriever, '_query_image_vec', lambda _: None)
+    monkeypatch.setattr(retriever.cache, 'get', lambda *_: None)
+    written = []
+    monkeypatch.setattr(retriever.cache, 'put', lambda *a: written.append(a))
+    text, media, route = retriever.retrieve('', 8, 'Zm9v')
+    assert text == [] and media == []
+    assert route.image_status == 'embedding_failed'
+    assert written == []
+
+
+def test_image_only_embedding_failure_chat_does_not_call_llm(monkeypatch):
+    import base64, io
+    from PIL import Image
+    from fastapi.testclient import TestClient
+    from sict_crawler.api.routes import app
+    from sict_crawler.service.retrieval import agent, vlm
+    image = io.BytesIO()
+    Image.new('RGB', (2, 2)).save(image, format='PNG')
+    result = {'text': [], 'media': [], 'context': '', 'sufficient': False, 'attempts': 1,
+              'image_status': 'embedding_failed'}
+    monkeypatch.setattr(agent, 'run', lambda *a: result)
+    monkeypatch.setattr(vlm, 'stream_answer', lambda *a, **kw: (_ for _ in ()).throw(AssertionError('LLM không được gọi')))
+    response = TestClient(app).post('/chat', json={'question': '', 'image': base64.b64encode(image.getvalue()).decode()})
+    assert response.status_code == 200
+    assert 'embedding_failed' in response.text
+    assert 'Không xử lý được ảnh' in response.text or 'Kh\\u00f4ng x\\u1eed l\\u00fd' in response.text
+    assert '[DONE]' in response.text
+
+
+def test_incomplete_stream_does_not_populate_answer_cache(monkeypatch):
+    from sict_crawler.service.retrieval import prompt_cache, vlm
+    def broken(*args, state, **kwargs):
+        yield 'câu trả lời cụt'
+        state.update(finish='truncated', error_code='network')
+    monkeypatch.setattr(prompt_cache, 'get_answer', lambda *a: None)
+    writes = []
+    monkeypatch.setattr(prompt_cache, 'put_answer', lambda *a: writes.append(a))
+    monkeypatch.setattr(vlm, 'stream_answer', broken)
+    status = {}
+    assert ''.join(prompt_cache.stream_answer_cached('q', 'c', state=status)) == 'câu trả lời cụt'
+    assert not writes and status['finish'] == 'truncated'
+
+
+def test_retry_500_then_nonstream_success_is_complete(monkeypatch):
+    vlm, calls = _seq_stream(monkeypatch, [(502, b'bad gateway'), [_content('Đã trả lời')]], retries=1)
+    state = {}
+    assert ''.join(vlm.stream_answer('q', 'ctx', state=state)) == 'Đã trả lời'
+    assert state['finish'] == 'done' and state['error_code'] is None
+    assert [entry[0] for entry in calls] == ['stream', 'post']

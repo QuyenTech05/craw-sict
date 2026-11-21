@@ -190,6 +190,7 @@ def _result(tsrcs, msrcs, ctx, attempts, sufficient, log, route, note: str | Non
             "wants_file": route.wants_file if route else None, "media_note": note,
             "inputs": list(getattr(route, "inputs", []) or []),
             "outputs": list(getattr(route, "outputs", []) or []),
+            "image_status": getattr(route, "image_status", "none"),
             "entities": list(getattr(route, "entities", []) or []),
             "list_question": bool(getattr(route, "list_question", False)),
             "graph_facts": list(getattr(route, "facts", []) or []),
