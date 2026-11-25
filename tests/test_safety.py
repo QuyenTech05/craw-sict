@@ -73,14 +73,15 @@ def test_llm_vlm_env_override(monkeypatch):
 
 
 def test_qdrant_collection_env_override(monkeypatch):
-    """Blue/green: mặc định v2; env trỏ về collection v1 để rollback API."""
+    """Chỉ chấp nhận các collection v3 với dimension cố định."""
     from sict_crawler.core.config import _build
+    import pytest
 
-    assert _build(_minimal_data()).qdrant.collection_text == "sict_text_v2"
+    assert _build(_minimal_data()).qdrant.collection_text == "sict_text_v3"
     monkeypatch.setenv("QDRANT_COLLECTION_TEXT", "sict_text")
     monkeypatch.setenv("QDRANT_COLLECTION_IMAGE", "sict_image")
-    s = _build(_minimal_data())
-    assert (s.qdrant.collection_text, s.qdrant.collection_image) == ("sict_text", "sict_image")
+    with pytest.raises(ValueError, match="index v3"):
+        _build(_minimal_data())
 
 
 class _NoRow:

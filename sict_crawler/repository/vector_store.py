@@ -1,18 +1,18 @@
 """Qdrant client: text + image collections, upsert, hybrid search.
 
 Callers: main.py, api.py, indexer.py, loader.py, query_rewriter.py.
-Schemas v2 (`*_v2`, indexer.py tạo payload; point id = uuid5 artifact):
-  text  — vector dense E5 (không tên) + sparse `bm25` (sparse.py, IDF phía Qdrant).
+Schema v3 (`*_v3`, indexer.py tạo payload; point id = uuid5 artifact):
+  text  — vector dense jina-clip-v2 1024 chiều + sparse `bm25` (sparse.py, IDF phía Qdrant).
           chunk {kind text|table, document_id, doc_key, chunk_id, idx, url, title, heading, content,
           section, section_label, doc_type, published_at, year, parent_url}
           caption {kind media_caption, media_kind image|video, media_key, video_key, document_id,
           url (ảnh/video), page_url, title, caption, section, doc_type, published_at, year, timestamp}
-  ocr   — (v3, `qdrant.collection_ocr`) điểm caption ở trên tách khỏi text, cùng dense + sparse; rỗng = caption
-          nằm chung collection text (v1/v2). Đọc/ghi qua ocr_collection() / text_collections() / collection_for().
-  image — CLIP. {kind image|video_frame, media_key (sha256), s3_key, url, document_id [int,...],
+  ocr   — (`qdrant.collection_ocr`) điểm caption tách khỏi text, cùng dense + sparse.
+          Đọc/ghi qua ocr_collection() / text_collections() / collection_for().
+  image — jina-clip-v2. {kind image|video_frame, media_key (sha256), s3_key, url, document_id [int,...],
           page_urls, title, caption, section [..], doc_type [..], year [..], published_at,
           timestamp, video_key} — 1 point / 1 file media, document_id là danh sách bài chứa nó.
-Schema v1 (sict_text/sict_image, chờ xoá): document_id int, media_id → media_assets.
+Các collection đang phục vụ phải là sict_text_v3/sict_ocr_v3/sict_image_v3.
 """
 from __future__ import annotations
 
@@ -89,8 +89,7 @@ def _with_retry(fn, *, tries: int = 3, base_delay: float = 2.0):
 
 def ocr_collection() -> str:
     """Collection của điểm caption (tiêu đề + mục + OCR ảnh/video, phụ đề video)."""
-    q = get_settings().qdrant
-    return q.collection_ocr or q.collection_text
+    return get_settings().qdrant.collection_ocr
 
 
 def text_collections() -> list[str]:
@@ -191,14 +190,29 @@ def has_sparse(collection: str | None = None) -> bool:
     return _caps[name]
 
 
-def require_v2() -> None:
-    """Đường ghi v2 (indexer) chỉ ghi vào collection schema v2 — tránh trộn payload v2 vào
-    collection v1 khi config/env còn trỏ tên cũ."""
-    name = get_settings().qdrant.collection_text
-    if not has_sparse(name):
-        raise RuntimeError(
-            f"collection {name!r} không phải schema v2 (thiếu sparse bm25). Trỏ "
-            "QDRANT_COLLECTION_TEXT/IMAGE sang *_v2 và chạy `python -m sict_crawler.pipeline.loader` trước.")
+def require_v3() -> None:
+    """Chặn ghi nếu collection v3 chưa có đúng schema jina-clip-v2 1024-d."""
+    from sict_crawler.core import sparse
+
+    cfg = get_settings().qdrant
+    targets = ((cfg.collection_text, True), (cfg.collection_ocr, True),
+               (cfg.collection_image, False))
+    if tuple(name for name, _ in targets) != ("sict_text_v3", "sict_ocr_v3", "sict_image_v3"):
+        raise RuntimeError("Qdrant writer chỉ hỗ trợ sict_text_v3/sict_ocr_v3/sict_image_v3")
+    client = get_client()
+    for name, with_sparse in targets:
+        try:
+            params = client.get_collection(name).config.params
+        except Exception as exc:
+            raise RuntimeError(f"Không đọc được schema v3 của {name}: {exc}") from exc
+        vectors = params.vectors
+        if (not isinstance(vectors, VectorParams) or vectors.size != 1024
+                or vectors.distance != Distance.COSINE):
+            raise RuntimeError(f"{name} phải dùng dense cosine 1024-d (unnamed)")
+        sparse_names = set(params.sparse_vectors or {})
+        expected = {sparse.VECTOR_NAME} if with_sparse else set()
+        if sparse_names != expected:
+            raise RuntimeError(f"{name} sparse vectors {sparse_names} khác schema v3 {expected}")
 
 
 def upsert_points(collection: str, points: list[PointStruct], batch: int = 256) -> None:

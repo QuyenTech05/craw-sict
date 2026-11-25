@@ -26,7 +26,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
-# API serve: FastAPI. Cần thêm group ml (E5+CLIP cho query).
+# API serve: HTTP embedding client và FastAPI.
 api = [
     "fastapi>=0.115",
     "langchain-core>=1.7,<2",
@@ -45,12 +45,8 @@ embed = [
     "tokenizers>=0.20",
     "huggingface-hub>=0.25",
 ]
-# Worker nặng: embed E5/CLIP + OCR + video keyframes + CDP client cho obscura.
-# torch lấy bản CPU (host và container đều không có GPU).
-ml = [
-    "torch",
-    "sentence-transformers>=3.0",
-    "transformers>=4.57",
+# Worker: OCR + video keyframes + CDP client cho Obscura.
+worker = [
     "pytesseract>=0.3.10",
     "yt-dlp>=2026.8.19",
     "playwright>=1.40",  # chỉ CDP client cho obscura sidecar; KHÔNG chạy `playwright install`
@@ -65,11 +61,3 @@ eval = [
 graph = [
     "underthesea>=9.5",
 ]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }

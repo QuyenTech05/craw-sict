@@ -5,15 +5,12 @@
 # VM2 rieng: docker compose -f docker-compose.worker.yml up -d   (image từ GHCR do CD ghi vào .env, D10)
 #   + .env theo .env.worker.example (POSTGRES_DSN/REDIS_URL/QDRANT_HOST = IP VM1).
 #
-# Index v3 (2026-11-05): worker đọc cùng bộ biến v3 như API (env_file .env + các dòng EMBED_* / QDRANT_* bên dưới).
-# Bỏ trống = mặc định config.yaml (backend torch, collection *_v2, index v2) — như local. Production v3 phải đặt trong
-# .env VM2: EMBED_BACKEND=api, EMBED_API_BASE, EMBED_MODEL, EMBED_DIM, QDRANT_COLLECTION_TEXT/IMAGE/OCR=*_v3,
-# QDRANT_TEXT_DIM/IMAGE_DIM=1024, CHUNK_STRUCTURED=1 (kiểm: `scripts/cutover_v3.sh env-check vm2`). Trước đó cron
-# không có env_file và không có các biến này → chạy torch 384-d, ghi *_v2, không ghi được *_v3 1024-d.
+# Worker chỉ dùng HTTP jina-clip-v2 và ba collection v3 1024-d.
+# Production VM2 khai báo EMBED_API_BASE trong .env và kiểm qua `scripts/cutover_v3.sh env-check vm2`.
 # EMBED_API_BASE mặc định http://embed:8090/v1: docker-compose.embed.yml chạy cùng thư mục → cùng project compose
 # (craw-sict) → cùng mạng `craw-sict_default`, tên service `embed` phân giải được. Embed ở nơi khác → đặt trong .env.
 x-worker-v3-env: &worker_v3_env
-  EMBED_BACKEND: ${EMBED_BACKEND:-}
+  EMBED_BACKEND: ${EMBED_BACKEND:-api}
   EMBED_API_BASE: ${EMBED_API_BASE:-http://embed:8090/v1}
   EMBED_API_KEY: ${EMBED_API_KEY:-}
   EMBED_MODEL: ${EMBED_MODEL:-jina-clip-v2}
@@ -22,12 +19,12 @@ x-worker-v3-env: &worker_v3_env
   EMBED_CACHE_PATH: ${EMBED_CACHE_PATH:-}   # sqlite cache vector theo hash; VD /app/_local_store/embed_cache.sqlite
   QDRANT_PORT: ${QDRANT_PORT:-}
   QDRANT_GRPC_PORT: ${QDRANT_GRPC_PORT:-}
-  QDRANT_COLLECTION_TEXT: ${QDRANT_COLLECTION_TEXT:-}
-  QDRANT_COLLECTION_IMAGE: ${QDRANT_COLLECTION_IMAGE:-}
-  QDRANT_COLLECTION_OCR: ${QDRANT_COLLECTION_OCR:-}
-  QDRANT_TEXT_DIM: ${QDRANT_TEXT_DIM:-}
-  QDRANT_IMAGE_DIM: ${QDRANT_IMAGE_DIM:-}
-  CHUNK_STRUCTURED: ${CHUNK_STRUCTURED:-}
+  QDRANT_COLLECTION_TEXT: ${QDRANT_COLLECTION_TEXT:-sict_text_v3}
+  QDRANT_COLLECTION_IMAGE: ${QDRANT_COLLECTION_IMAGE:-sict_image_v3}
+  QDRANT_COLLECTION_OCR: ${QDRANT_COLLECTION_OCR:-sict_ocr_v3}
+  QDRANT_TEXT_DIM: ${QDRANT_TEXT_DIM:-1024}
+  QDRANT_IMAGE_DIM: ${QDRANT_IMAGE_DIM:-1024}
+  CHUNK_STRUCTURED: ${CHUNK_STRUCTURED:-1}
   HF_HOME: /cache/hf
 
 services:

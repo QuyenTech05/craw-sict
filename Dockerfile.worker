@@ -1,23 +1,15 @@
 # syntax=docker/dockerfile:1
-# Worker incremental full: crawl render + OCR + embed E5/CLIP. BẮT BUỘC glibc (slim).
-# - torch/sentence-transformers/transformers: không có musl wheel → alpine build từ source (fail).
+# Worker incremental full: crawl render + OCR + HTTP embedding. BẮT BUỘC glibc (slim).
 # - obscura binary: link glibc 2.35+ → không chạy trên musl.
 # - tesseract-ocr-vie: chắc chắn có trên apt, không chắc trên apk.
-# Deps quản lý bằng uv (pyproject.toml group ml + graph + uv.lock), KHÔNG dùng pip/requirements.txt.
-# Build CPU (mặc định, VM thường): docker build -f Dockerfile.worker -t sict-worker .
-# Build GPU (máy thuê có NVIDIA, chạy compute): docker build -f Dockerfile.worker \
-#     --build-arg VARIANT=gpu -t sict-worker:gpu .   → chạy qua docker-compose.gpu.yml
-# Bản GPU thay torch CPU bằng torch CUDA cùng version (wheel tự mang CUDA runtime; host chỉ cần driver
-# NVIDIA + nvidia-container-toolkit). cu126 chạy với driver ≥ 525 (CUDA 12 minor-version compat), cu130 cần ≥ 580. Image GPU nặng hơn
-# vài GB nên KHÔNG dùng cho VM thường; code tự chọn device (embedding.device: auto).
+# Deps quản lý bằng uv (group worker + graph + uv.lock).
+# Build: docker build -f Dockerfile.worker -t sict-worker .
 ARG PYTHON_VERSION=3.11
 FROM python:${PYTHON_VERSION}-slim AS runtime
 COPY --from=ghcr.io/astral-sh/uv:0.12.19 /uv /uvx /bin/
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_COMPILE_BYTECODE=1 \
     OBSCURA_BIN=/usr/local/bin/obscura CRAWLER_BACKEND=auto
 ARG OBSCURA_VERSION=v0.2.4
-ARG VARIANT=cpu
-ARG TORCH_CUDA_INDEX=https://download.pytorch.org/whl/cu126
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr tesseract-ocr-vie tesseract-ocr-eng ffmpeg poppler-utils catdoc curl ca-certificates \
     && arch=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch64/') \
@@ -36,16 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project --group ml --group graph
-# GPU: đổi torch CPU → CUDA cùng version (giữ nguyên mọi deps khác theo uv.lock)
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ "$VARIANT" = "gpu" ]; then \
-      TV=$(/app/.venv/bin/python -c "import torch; print(torch.__version__.split('+')[0])") \
-      && uv pip install --python /app/.venv/bin/python --reinstall --no-deps \
-           --index-url "$TORCH_CUDA_INDEX" "torch==${TV}" \
-      && uv pip install --python /app/.venv/bin/python \
-           --index-url "$TORCH_CUDA_INDEX" --extra-index-url https://pypi.org/simple "torch==${TV}"; \
-    fi
+    uv sync --locked --no-dev --no-install-project --group worker --group graph
 COPY config.yaml ./
 COPY sict_crawler ./sict_crawler
 RUN /app/.venv/bin/python -c "import pytesseract; print(pytesseract.get_tesseract_version())" \

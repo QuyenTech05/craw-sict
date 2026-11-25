@@ -101,11 +101,10 @@ uuid5 cố định nên nạp lại là ghi đè, không nhân bản):
 
 | Index | Backend | Mô hình | Ghi chú |
 |---|---|---|---|
-| v2 (`*_v2`, mặc định cấu hình) | `torch` | multilingual-e5-small 384-d (chữ) + CLIP ViT-B/32 512-d (ảnh) | |
-| v3 (`*_v3`) | `api` | jina-clip-v2 1024-d, chữ và ảnh chung một không gian | dịch vụ tự host ONNX int8 trên CPU (`embed_server.py`, cổng 8090), cosine so với fp32: chữ 0,999, ảnh 1,000 |
+| v3 (`sict_{text,image,ocr}_v3`) | `api` | jina-clip-v2 1024-d, chữ và ảnh chung một không gian | dịch vụ tự host ONNX INT8 trên CPU (`embed_server.py`, cổng 8090) |
 
-Chuyển giữa hai bên chỉ là cấu hình (`embedding.backend`, `QDRANT_COLLECTION_*`); cutover kiểu
-blue/green, rollback = trỏ API về collection cũ.
+API và worker dùng duy nhất HTTP embedding gateway. Rollback chỉ đổi sang API image v3 đã
+được xác minh tương thích với fingerprint của index v3; xem [hướng dẫn deploy](docs/deploy_v3.md).
 
 ## Cấu trúc mã nguồn
 
@@ -118,7 +117,7 @@ Import tuyệt đối và chỉ trỏ xuống tầng dưới; `api` và `pipelin
 | `sict_crawler/repository/` | Postgres, Qdrant, S3 / kho local, hàng đợi Redis, cache Redis |
 | `sict_crawler/service/crawl/` | crawler, parser HTML → markdown + khối, phân loại URL |
 | `sict_crawler/service/index/` | luật index v2, chunker, OCR, video, đường ghi `indexer` |
-| `sict_crawler/service/embedding/` | client embedding (torch / HTTP), dịch vụ ONNX tự host |
+| `sict_crawler/service/embedding/` | HTTP embedding client, dịch vụ ONNX INT8 tự host |
 | `sict_crawler/service/retrieval/` | retriever, agent, router media, bộ lọc, trích dẫn, gọi LLM |
 | `sict_crawler/service/graph/` | graph khái niệm (cụm danh từ, D33): `concepts`, danh bạ `graph`, `graphsync` |
 | `sict_crawler/pipeline/` | CLI: crawl, incremental, snapshot, compute, loader, reconcile |
@@ -130,13 +129,13 @@ Import tuyệt đối và chỉ trỏ xuống tầng dưới; `api` và `pipelin
 ## Chạy local
 
 Yêu cầu: Docker, [uv](https://docs.astral.sh/uv/) (dependency **chỉ** quản lý bằng uv, không pip),
-Python ≥ 3.10. Nhóm dependency: `dev` (pytest), `api` (FastAPI), `ml` (torch CPU, sentence-transformers,
-OCR, yt-dlp), `embed` (dịch vụ ONNX), `eval` (RAGAS).
+Python ≥ 3.10. Nhóm dependency: `dev` (pytest), `api` (FastAPI), `worker` (OCR, yt-dlp,
+Playwright CDP), `graph` (underthesea), `embed` (dịch vụ ONNX), `eval` (RAGAS).
 
 ```bash
 cp .env.example .env                         # điền LLM_API_BASE / LLM_MODEL / LLM_API_KEY nếu cần câu trả lời sinh
 docker compose up -d postgres redis qdrant   # hạ tầng
-uv sync --group dev --group api              # thêm --group ml để embed / OCR / video
+uv sync --group dev --group api              # thêm --group worker --group graph cho pipeline media/graph
 
 # crawl thử 20 trang, hoặc một chu kỳ incremental
 uv run python -m sict_crawler.pipeline.main --crawl-limit 20
@@ -154,7 +153,7 @@ Index hàng loạt từ đầu:
 ```bash
 python -m sict_crawler.pipeline.snapshot --out _snapshot/2026-10-12        # chạy lại = resume
 python -m sict_crawler.pipeline.compute  --snapshot _snapshot/2026-10-12   # stages docs,text,images,videos
-python -m sict_crawler.pipeline.loader   --artifacts _snapshot/2026-10-12/artifacts/v3-jina-clip-v2   # v2: v2-multilingual-e5-small
+python -m sict_crawler.pipeline.loader   --artifacts _snapshot/2026-10-12/artifacts/v3-jina-clip-v2
 python -m sict_crawler.service.graph.graphsync rebuild                      # graph khái niệm (cụm danh từ; loader đã gọi sau khi nạp)
 python -m sict_crawler.pipeline.reconcile --dry-run                         # kiểm PG ↔ Qdrant
 ```
@@ -165,8 +164,8 @@ python -m sict_crawler.pipeline.reconcile --dry-run                         # ki
 |---|---|
 | `POST /query` | `{question, top_k, image?, filters?}` → nguồn chữ, media, route, `sufficient`, trích dẫn |
 | `POST /chat` | cùng đầu vào, trả SSE: `status` → `sources` → các mảnh câu trả lời → `citations` → `[DONE]` |
-| `GET /media/s/{sha256}` | ảnh / keyframe (index v2/v3) |
-| `GET /media/{id}` | ảnh index v1 |
+| `GET /media/s/{sha256}` | ảnh / keyframe trong kho media |
+| `GET /media/{id}` | endpoint tương thích ID media cũ |
 | `GET /metrics` | Prometheus: request, độ trễ, heartbeat pipeline, số tài liệu, hàng đợi |
 | `GET /` | giao diện chat |
 
@@ -185,7 +184,7 @@ trường ghi đè khi triển khai:
 | Biến | Dùng cho |
 |---|---|
 | `POSTGRES_DSN`, `REDIS_URL`, `QDRANT_HOST` / `QDRANT_PORT` / `QDRANT_GRPC_PORT` | kết nối hạ tầng |
-| `QDRANT_COLLECTION_TEXT` / `_IMAGE` / `_OCR` | collection đang phục vụ (`*_v2`, `*_v3`) |
+| `QDRANT_COLLECTION_TEXT` / `_IMAGE` / `_OCR` | `sict_text_v3`, `sict_image_v3`, `sict_ocr_v3` |
 | `LLM_API_BASE`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_MAX_NEW_TOKENS` | LLM trả lời, API tương thích OpenAI |
 | `EMBED_API_BASE`, `EMBED_MODEL`, `EMBED_DIM`, `EMBED_API_KEY` | backend embedding `api` |
 | `AWS_PROFILE` hoặc `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT_URL` | kho đối tượng (S3 / MinIO) |

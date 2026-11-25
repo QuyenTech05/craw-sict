@@ -301,11 +301,7 @@ def rerank_text(hits: list[dict], question: str, top_n: int = 5, reorder: bool =
             return hits[:top_n]
     if scored:
         texts = [f"{h.get('title', '')}. {h.get('content') or h.get('caption') or ''}"[:1000] for h in scored]
-        if embedder.backend() == "api":   # D22: tiền tố query do embedder áp (kind="query"), không gắn chữ vào văn bản
-            qv, tvecs = qvec or embedder.embed_query(question), embedder.embed_texts(texts)
-        else:
-            vecs = embedder.embed_texts([f"query: {question}"] + [f"passage: {t}" for t in texts])
-            qv, tvecs = vecs[0], vecs[1:]
+        qv, tvecs = qvec or embedder.embed_query(question), embedder.embed_texts(texts)
         for h, tv in zip(scored, tvecs):
             h["raw_score"] = sum(a * b for a, b in zip(qv, tv))  # cosine in [-1,1]
             if reorder:

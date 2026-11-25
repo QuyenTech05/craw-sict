@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cutover production sang index v3 (D8/D16/D22: jina-clip-v2 1024-d, 3 collection *_v3, embed int8 tự host trên VM2)
-# — từng bước do người vận hành gọi, KHÔNG gộp tự động. Collection cũ (v1/v2) và cột cũ của Postgres không bị đụng
-# → rollback = đổi QDRANT_COLLECTION_* trong .env rồi `docker compose up -d api`.
+# — từng bước do người vận hành gọi, KHÔNG gộp tự động. Rollback chỉ đổi API image
+# khi fingerprint index v3 hiện tại khớp với fingerprint của image v3 trước đó.
 #
 #   Đường chính (quyết định chủ dự án 2026-11-05: production nhận ĐÚNG trạng thái index v3 của máy dev):
 #   (máy dev) ./scripts/cutover_v3.sh export            pg_dump + snapshot Qdrant sict_{text,image,ocr}_v3 + manifest.json
@@ -22,7 +22,7 @@
 #   (VM1|VM2) ./scripts/cutover_v3.sh env-check vm1|vm2 .env có đủ biến v3 (chỉ in TÊN biến) + store_auth.sh check
 #   (VM1)     ./scripts/cutover_v3.sh backup            pg_dump + snapshot Qdrant các collection đang có → ~/backup-v3-<ngày>/
 #   (dev/VM1) ./scripts/cutover_v3.sh verify            golden_v2 / list_v2 + accept_api qua HTTP (API=…)
-#   (VM1)     ./scripts/cutover_v3.sh rollback          in hướng dẫn; CONFIRM_ROLLBACK=yes [ROLLBACK_TO=v2|v1] thì làm thật
+#   (VM1)     ./scripts/cutover_v3.sh rollback          kiểm tra API_IMAGE_PREV + fingerprint v3, chỉ đổi image khi CONFIRM_ROLLBACK=yes
 #
 # Thứ tự production (docs/deploy_v3.md): CD vm2 + deploy_embed → dừng cron → export (dev) → upload-media-store
 # → backup (VM1) → dừng API → restore (VM1) → CD vm1 (API đọc .env v3) → verify → bật cron.
@@ -484,31 +484,67 @@ PY
     run python -m sict_crawler.pipeline.loader --artifacts "$ART" --snapshot "$SNAP" --media-only --upload-media
     ;;
   rollback)
-    to=${ROLLBACK_TO:-v2}
-    case "$to" in
-      v2) ct=sict_text_v2; ci=sict_image_v2 ;;
-      v1) ct=sict_text;    ci=sict_image ;;
-      *) echo "ROLLBACK_TO=v2|v1"; exit 2 ;;
-    esac
-    cat <<EOF
-Rollback API về index $to (không mất dữ liệu: collection $ct/$ci + cột cũ của Postgres còn nguyên; chỉ đổi cấu hình):
-  1. VM1 $ENV_FILE: QDRANT_COLLECTION_TEXT=$ct  QDRANT_COLLECTION_IMAGE=$ci  QDRANT_COLLECTION_OCR=  (trống)
-     QDRANT_TEXT_DIM=384  QDRANT_IMAGE_DIM=512  EMBED_BACKEND=torch  API_MEM_LIMIT=1500m (API tự nạp E5 + CLIP)
-     → docker compose up -d api      (image giữ nguyên; code v3 đọc được collection cũ)
-  2. VM2: docker compose -f $WORKER_COMPOSE stop cron   (worker v3 từ chối ghi collection v1; với v2 thì sửa .env VM2 giống bước 1)
-  3. Image cũ (nếu cần): CD với tag cũ, hoặc API_IMAGE=\$API_IMAGE_PREV trong .env rồi docker compose up -d api.
-  4. Postgres: bảng / cột v3 chỉ thêm mới, code cũ bỏ qua. Khôi phục hẳn: pg_restore bản dump ở bước backup.
-Làm thật bước 1 ngay: CONFIRM_ROLLBACK=yes ROLLBACK_TO=$to ./scripts/cutover_v3.sh rollback
-EOF
-    [ "${CONFIRM_ROLLBACK:-}" = "yes" ] || exit 0
-    upsert() { if grep -q "^$1=" "$ENV_FILE"; then sed -i "s#^$1=.*#$1=$2#" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi; }
-    cp "$ENV_FILE" "$ENV_FILE.bak-$(date +%Y%m%d-%H%M)"
-    upsert QDRANT_COLLECTION_TEXT "$ct"; upsert QDRANT_COLLECTION_IMAGE "$ci"; upsert QDRANT_COLLECTION_OCR ""
-    upsert QDRANT_TEXT_DIM 384; upsert QDRANT_IMAGE_DIM 512; upsert EMBED_BACKEND torch; upsert API_MEM_LIMIT 1500m
-    say "đã sửa $ENV_FILE (bản cũ: $ENV_FILE.bak-*) → recreate API"
-    run docker compose up -d api
-    for i in $(seq 1 30); do curl -sf -m 10 "$API/app.js" -o /dev/null && break; sleep 10; done
-    run curl -sf -m 10 "$API/app.js" -o /dev/null && echo "API lên lại với index $to"
+    if [ -n "${ROLLBACK_TO:-}" ]; then
+      echo "Rollback chỉ hỗ trợ image v3 tương thích; bỏ ROLLBACK_TO và dùng API_IMAGE_PREV." >&2
+      exit 2
+    fi
+    if [ ! -f "$ENV_FILE" ]; then
+      echo "Thiếu $ENV_FILE chứa trạng thái image/index v3." >&2
+      exit 2
+    fi
+    # Fingerprint SHA256 lấy từ manifest index v3 đã được kiểm tra lúc phát hành.
+    # Một image sử dụng fingerprint khác phải được rollback kèm snapshot v3 đã thẩm định riêng.
+    current_fp=$(val V3_INDEX_FINGERPRINT)
+    prev_fp=$(val PREV_V3_INDEX_FINGERPRINT)
+    prev_image=$(val API_IMAGE_PREV)
+    current_image=$(val API_IMAGE)
+    if [[ ! "$current_fp" =~ ^[a-f0-9]{64}$ || ! "$prev_fp" =~ ^[a-f0-9]{64}$ || "$current_fp" != "$prev_fp" ]]; then
+      echo "Từ chối rollback: thiếu hoặc không khớp fingerprint SHA256 index v3 hiện tại/trước đó." >&2
+      exit 2
+    fi
+    if [ -z "$prev_image" ] || [ -z "$current_image" ] || [ "$prev_image" = "$current_image" ]; then
+      echo "Từ chối rollback: cần API_IMAGE và API_IMAGE_PREV khác nhau (đều là image v3)." >&2
+      exit 2
+    fi
+    if [ "$(val EMBED_BACKEND)" != api ] || [ "$(val EMBED_DIM)" != 1024 ] \
+        || [ "$(val QDRANT_COLLECTION_TEXT)" != sict_text_v3 ] \
+        || [ "$(val QDRANT_COLLECTION_IMAGE)" != sict_image_v3 ] \
+        || [ "$(val QDRANT_COLLECTION_OCR)" != sict_ocr_v3 ] \
+        || [ "$(val QDRANT_TEXT_DIM)" != 1024 ] || [ "$(val QDRANT_IMAGE_DIM)" != 1024 ]; then
+      echo "Từ chối rollback: $ENV_FILE không còn cấu hình embedding/collections v3 1024 chiều." >&2
+      exit 2
+    fi
+    say "Đã kiểm tra fingerprint index v3 tương thích và API_IMAGE_PREV có tồn tại."
+    if [ "${CONFIRM_ROLLBACK:-}" != yes ]; then
+      echo "Để đổi API image trên VM1: CONFIRM_ROLLBACK=yes ./scripts/cutover_v3.sh rollback"
+      exit 0
+    fi
+    # Sao lưu trước khi ghi. Khi restart lỗi, khôi phục cấu hình và image API cũ.
+    backup_env="$ENV_FILE.bak-$(date +%Y%m%d-%H%M%S)"
+    cp "$ENV_FILE" "$backup_env"
+    python3 - "$ENV_FILE" "$prev_image" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+image = sys.argv[2]
+lines = path.read_text().splitlines(keepends=True)
+found = False
+for i, line in enumerate(lines):
+    if line.startswith("API_IMAGE="):
+        lines[i] = f"API_IMAGE={image}\n"
+        found = True
+if not found:
+    lines.append(f"API_IMAGE={image}\n")
+path.write_text("".join(lines))
+PY
+    if ! docker compose up -d api || ! curl -sf -m 15 "$API/app.js" -o /dev/null; then
+      cp "$backup_env" "$ENV_FILE"
+      docker compose up -d api || true
+      echo "Rollback image v3 không thành công; đã phục hồi $ENV_FILE từ bản sao lưu." >&2
+      exit 1
+    fi
+    say "API image v3 đã rollback, fingerprint index giữ nguyên; bản sao lưu: $backup_env"
     ;;
   *)
     sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 1 ;;

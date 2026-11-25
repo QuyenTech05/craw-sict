@@ -29,7 +29,7 @@ _LOG = logging.getLogger(__name__)
 
 
 def index_tag() -> str:
-    """Collection đang phục vụ: đổi v2 ↔ v3 (cutover / rollback) thì không lấy lại kết quả cache của index kia."""
+    """Fingerprint ba collection v3 để không dùng lại cache khi đổi index."""
     q = get_settings().qdrant
     return f"{q.collection_text}|{q.collection_image}|{q.collection_ocr}"
 
@@ -448,7 +448,7 @@ def retrieve(question: str, top_k: int = 5,
 
     Đa phương thức (D21, embedding.backend=api, chữ+ảnh chung không gian): ảnh gửi lên vừa tìm ảnh giống
     (i2i), vừa tìm chunk/caption (i2t), và kéo chunk của BÀI chứa ảnh gần trùng (i2i-doc); chỉ có ảnh
-    (question rỗng) → ra cả ảnh lẫn chữ. Backend torch giữ hành vi cũ: ảnh chỉ thêm 1 vector vào nhánh CLIP.
+    (question rỗng) → ra cả ảnh lẫn chữ qua jina-clip-v2.
 
     Cache Redis 10p theo (question, top_k, filters, hash ảnh).
     """
@@ -465,8 +465,7 @@ def retrieve(question: str, top_k: int = 5,
             candidate = False
     if plan is not None and settings.planner_mode == "shadow":
         _LOG.info("retrieval_shadow mode=%s confidence=%.2f", plan.mode, understanding.confidence)
-    unified = embedder.backend() == "api"
-    has_text = bool(question.strip()) or not unified   # unified: question rỗng = truy vấn chỉ có ảnh
+    has_text = bool(question.strip())
     # metadata: lọc cứng chỉ từ `filters` caller truyền; câu hỏi chỉ cho ưu tiên mềm (filters.py)
     f = F.merge(F.from_request(filters), F.infer(question))
     qf = F.to_qdrant(f)
@@ -481,7 +480,7 @@ def retrieve(question: str, top_k: int = 5,
         except Exception:
             pass
     # ảnh truy vấn (CPU, ~4 s ở 336 px) nhúng trong lúc phần chữ chạy (luật viết tắt, graph, nhúng câu hỏi)
-    ifut = _STAGE_POOL.submit(_query_image_vec, query_image_b64) if unified and query_image_b64 else None
+    ifut = _STAGE_POOL.submit(_query_image_vec, query_image_b64) if query_image_b64 else None
     if has_text:
         r = query_rewriter.rewrite(question, allow_llm=False) if route_override is not None else query_rewriter.rewrite(question)
         route = route_override or router.decide(question, r.get("route_llm"), has_image=bool(query_image_b64))
@@ -528,19 +527,10 @@ def retrieve(question: str, top_k: int = 5,
     # số media tối đa theo ý định (router.media_cap): `none` = rc.none_max (mặc định 0 → không chạy nhánh media)
     n_media = router.media_cap(route, top_k, rc.optional_max, rc.none_max)
     img_query_vecs: list = []
-    if unified:
-        clip_min, caption_min = rc.t2i_min, rc.t2c_min
-    else:
-        clip_min, caption_min = rc.clip_min, rc.caption_min
+    clip_min, caption_min = rc.t2i_min, rc.t2c_min
     if n_media > 0:
-        if unified:
-            img_query_vecs = [rvec] if rvec is not None else []
-            image_vecs = [ivec] if ivec is not None else []
-        else:
-            img_query_vecs = [embedder.embed_text_clip([r["rewritten"]])[0]]
-            image_vecs = []
-            if (qvec := _query_image_vec(query_image_b64)) is not None:
-                img_query_vecs.append(qvec)
+        img_query_vecs = [rvec] if rvec is not None else []
+        image_vecs = [ivec] if ivec is not None else []
         # ý định `none` (none_max > 0): chỉ ảnh của bài chữ đứng đầu (_doc_media), không tìm toàn collection
         if route.media != "none" and (not candidate or plan.mode in {"media_first", "parallel_multimodal"}):
             if not candidate:

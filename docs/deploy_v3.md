@@ -140,7 +140,8 @@ CD **không** ghi các biến này — người vận hành soạn tay, CD chỉ
 | `API_MEM_LIMIT=600m` | | API backend `api` ~200 MiB; trả ~900 MB cho VM1 |
 | `LLM_API_BASE`, `LLM_MODEL`, `LLM_API_KEY` | của khách | thiếu → `/chat` chỉ echo ngữ cảnh |
 | `AWS_PROFILE` (có `~/.aws`) hoặc `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | | `/media/s/<sha256>` đọc S3 |
-| `API_IMAGE` (+ `API_IMAGE_PREV`) | CD ghi | rollback image |
+| `API_IMAGE` (+ `API_IMAGE_PREV`) | CD ghi | rollback API image v3 |
+| `V3_INDEX_FINGERPRINT`, `PREV_V3_INDEX_FINGERPRINT` | SHA256 manifest index v3 đã kiểm tra | hai giá trị phải trùng nhau khi rollback giữa hai API image v3 tương thích |
 
 **VM2 (`.env.worker.example`)**
 
@@ -160,24 +161,28 @@ CD **không** ghi các biến này — người vận hành soạn tay, CD chỉ
   `q:v10:*` (Redis db 3) trước khi đo.
 - `scripts/monitor_2vm.sh infra` (VM1) / `worker` (VM2); `GET /metrics` có `sict_pipeline_metrics_up 1`.
 - D12 trên máy thật: Redis không mật khẩu → NOAUTH; `curl http://<IP-VM1>:6333/collections` không key → 401/403.
-- RAM: `docker stats` API < 600 MiB, Qdrant < 1.100 MiB (giữ v3 + collection cũ), embed < 6 GB.
+- RAM: `docker stats` API < 600 MiB, Qdrant < 1.100 MiB, embed < 6 GB.
 
-## 4. Rollback
+## 4. Rollback v3
 
-- **API về index cũ (không mất dữ liệu)**: `CONFIRM_ROLLBACK=yes ROLLBACK_TO=v2|v1 ./scripts/cutover_v3.sh rollback`
-  trên VM1 = sửa `QDRANT_COLLECTION_*`, `QDRANT_TEXT_DIM/IMAGE_DIM`, `EMBED_BACKEND=torch`, `API_MEM_LIMIT=1500m`
-  trong `.env` (bản cũ giữ ở `.env.bak-*`) rồi `docker compose up -d api`. Chỉ có ý nghĩa khi VM1 còn collection
-  đó (production hiện chỉ có v1: `sict_text` / `sict_image`).
-- **Image cũ**: CD với tag cũ, hoặc `API_IMAGE=$API_IMAGE_PREV` (`WORKER_IMAGE_PREV`, `EMBED_IMAGE_PREV`) rồi `up -d`.
-- **Worker**: `docker compose -f docker-compose.worker.yml stop cron` (worker v3 từ chối ghi collection v1).
-- **Postgres**: đường artifact (`load`) chỉ thêm bảng / cột, code cũ bỏ qua. Đường máy dev (`restore`) thay cả DB:
-  rollback về v1 phải khôi phục bản dump của bước 8 theo cùng cách restore làm (API dừng; `psql -U sict -d postgres`
-  trong container: `DROP DATABASE sict_crawler WITH (FORCE)` + `CREATE DATABASE sict_crawler OWNER sict`; rồi
-  `docker compose exec -T postgres pg_restore -U sict -d sict_crawler --no-owner --no-privileges --exit-on-error
-  < ~/backup-v3-*/sict_crawler.dump`), sau đó đổi `.env` như trên. `--clean` trên DB v3 không đủ: bảng v3 có khoá
-  ngoại tới `documents` chặn DROP.
-- Nạp lại sạch: `restore` chạy lại được (DROP DATABASE + snapshot `priority=snapshot` thay collection cùng tên);
-  đường artifact: `./scripts/cutover_v3.sh load` với `LOAD_RECREATE=yes` (loader `--recreate`).
+Rollback API dùng image v3 trước đó (`API_IMAGE_PREV`) với **cùng fingerprint index v3**. Trước khi thực hiện,
+người vận hành kiểm tra manifest của bộ dữ liệu và xác nhận image trước đó sử dụng cùng model,
+dimension và collections. Ghi SHA256 của manifest vào `V3_INDEX_FINGERPRINT` và
+`PREV_V3_INDEX_FINGERPRINT` trong `.env`. Hai giá trị SHA256 64 ký tự phải trùng nhau.
+Giữ `EMBED_BACKEND=api`, `EMBED_DIM=1024`, `QDRANT_TEXT_DIM=1024`,
+`QDRANT_IMAGE_DIM=1024` và ba collection `sict_{text,image,ocr}_v3`.
+
+Chạy `./scripts/cutover_v3.sh rollback` để kiểm tra và xem hướng dẫn ở chế độ đọc.
+Chỉ khi đã cho phép thay image trên VM1 mới chạy
+`CONFIRM_ROLLBACK=yes ./scripts/cutover_v3.sh rollback`. Script sao lưu `.env`,
+đổi `API_IMAGE`, khởi động lại API và kiểm tra `/app.js`; nếu thất bại, script phục hồi
+`.env` rồi khởi động lại image ban đầu. Rollback sang snapshot/index v3 **khác fingerprint**
+cần quy trình restore v3 được kiểm thử riêng. Trong khi restore, dừng cron trên VM2 để tránh
+ghi dữ liệu đồng thời. Bản backup Postgres/Qdrant ở bước 8 phục vụ khôi phục trạng thái v3.
+
+Lệnh `restore` có thể chạy lại từ snapshot v3 đã thẩm định (thay collection cùng tên).
+Đường artifact dùng `./scripts/cutover_v3.sh load` với `LOAD_RECREATE=yes` để nạp lại
+index v3 khi được chủ dự án cho phép.
 
 ## 5. Việc chủ dự án phải quyết (chưa có trong repo)
 

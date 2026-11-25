@@ -36,9 +36,9 @@ def test_worker_passes_v3_vars_from_env(svc):
     for k in V3_VARS:
         assert k in env, f"{svc} thiếu {k}"
         assert env[k].startswith("${" + k), f"{svc}: {k} phải lấy từ .env (${{{k}:-…}}), đang là {env[k]!r}"
-    # bỏ trống = config.yaml (local v2); default chỉ đặt cho những gì không đổi ý nghĩa khi backend torch
-    assert env["EMBED_BACKEND"] == "${EMBED_BACKEND:-}"
-    assert env["QDRANT_COLLECTION_TEXT"] == "${QDRANT_COLLECTION_TEXT:-}"
+    # Compose không có .env vẫn chạy theo cấu hình API-only và collections v3.
+    assert env["EMBED_BACKEND"] == "${EMBED_BACKEND:-api}"
+    assert env["QDRANT_COLLECTION_TEXT"] == "${QDRANT_COLLECTION_TEXT:-sict_text_v3}"
     assert env["EMBED_API_BASE"] == "${EMBED_API_BASE:-http://embed:8090/v1}"
     assert env["EMBED_DIM"] == "${EMBED_DIM:-1024}"
     assert env["HF_HOME"] == "/cache/hf"
@@ -106,13 +106,85 @@ def test_env_check(tmp_path, role, env, ok):
     assert SECRET not in r.stdout + r.stderr                                         # không in bí mật
 
 
-def test_rollback_prints_only_without_confirm(tmp_path):
+def test_rollback_requires_previous_v3_fingerprint(tmp_path):
     f = tmp_path / "x.env"
     f.write_text(V3_BLOCK)
     r = subprocess.run(["bash", str(SCRIPT), "rollback"], capture_output=True, text=True,
                        env={**os.environ, "ENV_FILE": str(f), "LC_ALL": "C", "CONFIRM_ROLLBACK": ""})
-    assert r.returncode == 0 and "sict_text_v2" in r.stdout
-    assert f.read_text() == V3_BLOCK                                                  # không sửa .env
+    assert r.returncode == 2
+    assert "v3" in r.stdout + r.stderr
+    assert "sict_text_v2" not in r.stdout + r.stderr
+    assert f.read_text() == V3_BLOCK
+
+
+def _rollback_env() -> str:
+    fingerprint = "a" * 64
+    return (V3_BLOCK + f"V3_INDEX_FINGERPRINT={fingerprint}\n"
+            + f"PREV_V3_INDEX_FINGERPRINT={fingerprint}\n"
+            + "API_IMAGE=ghcr.io/example/sict-api:v3-new\n"
+            + "API_IMAGE_PREV=ghcr.io/example/sict-api:v3-old\n")
+
+
+@pytest.mark.parametrize("old, new", [
+    ("EMBED_BACKEND=api", "EMBED_BACKEND=torch"),
+    ("EMBED_DIM=1024", "EMBED_DIM=384"),
+    ("QDRANT_TEXT_DIM=1024", "QDRANT_TEXT_DIM=384"),
+    ("QDRANT_IMAGE_DIM=1024", "QDRANT_IMAGE_DIM=512"),
+    ("sict_image_v3", "sict_image_v2"),
+    ("sict_ocr_v3", "sict_ocr_v2"),
+    ("PREV_V3_INDEX_FINGERPRINT=" + "a" * 64, "PREV_V3_INDEX_FINGERPRINT=" + "b" * 64),
+    ("API_IMAGE_PREV=ghcr.io/example/sict-api:v3-old", "API_IMAGE_PREV=ghcr.io/example/sict-api:v3-new"),
+])
+def test_rollback_rejects_incompatible_config_without_mutation(tmp_path, old, new):
+    f = tmp_path / "rollback.env"
+    initial = _rollback_env().replace(old, new)
+    f.write_text(initial)
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "rollback"], capture_output=True, text=True,
+        env={**os.environ, "ENV_FILE": str(f), "CONFIRM_ROLLBACK": "yes"},
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert f.read_text() == initial
+    assert not list(tmp_path.glob("*.bak-*"))
+
+
+def test_rollback_v3_dry_run_is_read_only(tmp_path):
+    f = tmp_path / "rollback.env"
+    initial = _rollback_env()
+    f.write_text(initial)
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "rollback"], capture_output=True, text=True,
+        env={**os.environ, "ENV_FILE": str(f), "CONFIRM_ROLLBACK": ""},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CONFIRM_ROLLBACK=yes" in result.stdout
+    assert f.read_text() == initial
+    assert not list(tmp_path.glob("*.bak-*"))
+
+
+def test_rollback_confirm_only_updates_v3_api_image(tmp_path):
+    f = tmp_path / "rollback.env"
+    old_image = "ghcr.io/example/sict-api:v3-old"
+    f.write_text(_rollback_env())
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "calls.txt"
+    for executable in ("docker", "curl"):
+        stub = bindir / executable
+        stub.write_text(f"#!/bin/sh\nprintf '%s\\n' '{executable}' >> \"$TRACE_LOG\"\n")
+        stub.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "rollback"], capture_output=True, text=True,
+        env={**os.environ, "ENV_FILE": str(f), "CONFIRM_ROLLBACK": "yes",
+             "PATH": str(bindir) + os.pathsep + os.environ["PATH"], "TRACE_LOG": str(calls)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = _rollback_env().replace("API_IMAGE=ghcr.io/example/sict-api:v3-new",
+                                       f"API_IMAGE={old_image}")
+    assert f.read_text() == expected
+    assert calls.read_text().splitlines() == ["docker", "curl"]
+    backups = list(tmp_path.glob("*.bak-*"))
+    assert len(backups) == 1 and backups[0].read_text() == _rollback_env()
 
 
 def test_upload_media_refused_without_confirm():
@@ -149,7 +221,7 @@ def test_compose_config_renders_without_env(files):
     if "docker-compose.worker.yml" in files:
         rendered = yaml.safe_load(r.stdout)["services"]["cron"]["environment"]
         assert rendered["EMBED_API_BASE"] == "http://embed:8090/v1"
-        assert rendered["EMBED_BACKEND"] == "" and rendered["QDRANT_COLLECTION_TEXT"] == ""
+        assert rendered["EMBED_BACKEND"] == "api" and rendered["QDRANT_COLLECTION_TEXT"] == "sict_text_v3"
 
 
 def test_worker_lite_fits_512mb():

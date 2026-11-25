@@ -64,15 +64,13 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379/0
       QDRANT_HOST: qdrant
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
-      HF_HOME: /cache/hf  # share model cache, khỏi tải lại E5/CLIP mỗi recreate
+      HF_HOME: /cache/hf
       AWS_PROFILE: ${AWS_PROFILE-quyen-admin}
     depends_on: [postgres, redis, qdrant]
     volumes: [hfcache:/cache/hf, "${AWS_DIR:-${HOME}/.aws}:/home/app/.aws:ro", "${API_LOCAL_STORE:-api_localstore}:/app/_local_store:ro"]
     restart: unless-stopped
-    # Index v2 (mặc định, embedding.backend torch): API tự nạp E5 + CLIP → đo 2026-11-01 anon ~820 MiB + ~600 MiB
-    # cache file model, chạm 1,5 GB → giữ 1.500 MB. Sau cutover v3 (EMBED_BACKEND=api, embed ở VM2) API chỉ
-    # ~200 MiB → đặt API_MEM_LIMIT=600m trong .env, trả ~900 MB cho VM1.
-    mem_limit: ${API_MEM_LIMIT:-1500m}
+    # API chỉ dùng HTTP embed gateway, không nạp model tại tiến trình API.
+    mem_limit: ${API_MEM_LIMIT:-600m}
     logging: {driver: json-file, options: {max-size: 10m, max-file: "3"}}
 
   # L0 edge: reverse proxy + cache truoc api (AC-K1..K5). Nghe 8080,

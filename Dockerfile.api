@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
-# API serve: cần E5 + CLIP cho query → cần torch → slim, không alpine được.
-# Deps quản lý bằng uv (pyproject.toml groups api+ml + uv.lock), KHÔNG dùng pip/requirements.txt.
+# API serve: HTTP embedding client; không tải model local.
+# Deps quản lý bằng uv (group api + uv.lock).
 # Build: docker build -f Dockerfile.api -t sict-api .
 ARG PYTHON_VERSION=3.11
 FROM python:${PYTHON_VERSION}-slim AS runtime
@@ -10,7 +10,7 @@ RUN useradd -m -u 10000 app
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project --group api --group ml
+    uv sync --locked --no-dev --no-install-project --group api
 COPY config.yaml ./
 COPY sict_crawler ./sict_crawler
 ENV PATH="/app/.venv/bin:$PATH"

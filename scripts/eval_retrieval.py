@@ -1,7 +1,7 @@
 """Đánh giá retrieval offline trên artifact (compute.py) với bộ câu hỏi vàng (AC-G3).
 
 Không cần Qdrant/LLM (không rewrite câu hỏi):
-  dense         cosine brute-force trên chunks.npy (E5, query: prefix)
+  dense         cosine brute-force trên chunks.npy (jina-clip-v2 1024-d, HTTP query)
   bm25          BM25 trên chunk text đã bỏ dấu (xấp xỉ nhánh keyword `text_folded`, D8)
   hybrid        RRF(dense, bm25)
   hybrid+boost  hybrid rồi nhân ưu tiên mềm metadata (filters.apply_boost, D18)
@@ -10,8 +10,8 @@ parent_url của chunk (đính kèm tính về trang chứa nó), chuẩn hoá h
 Câu hỏi thời gian không có URL cố định dùng `expect_any` (mục + khoảng ngày) — đạt nếu ≥1 tài liệu
 top-5 khớp.
 
-Usage (cần embedder → chạy trong image worker/api, hoặc venv có group ml):
-  python scripts/eval_retrieval.py --artifacts _snapshot/2026-10-12/artifacts/v2-multilingual-e5-small \\
+Usage (cần HTTP embed endpoint và artifact v3):
+  uv run python scripts/eval_retrieval.py --artifacts _snapshot/2026-10-12/artifacts/v3-jina-clip-v2 \\
       --golden eval/golden_v2.jsonl --out eval/results
 """
 from __future__ import annotations
@@ -128,8 +128,14 @@ def main() -> None:
 
     from sict_crawler.core.config import get_settings
     from sict_crawler.service.embedding import embedder
-    get_settings().embedding.text_model = manifest["text_model"]
-    print(f"model={manifest['text_model']} chunks={len(chunks)} device={embedder.get_device()}", flush=True)
+    expected = get_settings().embedding
+    for key, value in (("backend", "api"), ("text_model", expected.model),
+                       ("dim", expected.dim), ("query_prefix", expected.query_prefix)):
+        if manifest.get(key) != value:
+            raise SystemExit(f"manifest {key} không khớp cấu hình embedding v3")
+    if vecs.ndim != 2 or vecs.shape[1] != expected.dim:
+        raise SystemExit(f"artifact vectors phải có {expected.dim} chiều")
+    print(f"model={expected.model} chunks={len(chunks)} backend=api", flush=True)
 
     bm25 = BM25([c["text"] for c in chunks])
     meta_by_doc = {}

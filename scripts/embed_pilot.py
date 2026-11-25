@@ -2,7 +2,7 @@
 Không ghi DB / Qdrant / S3; chỉ gọi endpoint embedding (EMBED_API_BASE/KEY, backend api).
 
   EMBED_BACKEND=api EMBED_API_BASE=... EMBED_API_KEY=... \
-    python scripts/embed_pilot.py --artifacts _snapshot/2026-10-12/artifacts/v2-multilingual-e5-small \
+    uv run python scripts/embed_pilot.py --artifacts _snapshot/2026-10-12/artifacts/v3-jina-clip-v2 \
         --snapshot _snapshot/2026-10-12 --n-text 50 --n-img 20
 
 Chạy toàn bộ (compute) chỉ sau khi owner xem số ước tính và đồng ý.

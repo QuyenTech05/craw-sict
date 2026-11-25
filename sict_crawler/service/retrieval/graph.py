@@ -46,7 +46,7 @@ def _cache_lookup(state: RetrievalState) -> dict:
         'route_policy': hybrid_router.ROUTE_POLICY_VERSION,
         'router_max_tokens': cfg.router_max_new_tokens or cfg.max_new_tokens,
         'embedding': {k: getattr(settings.embedding, k) for k in
-                      ('backend', 'model', 'text_model', 'image_model', 'dim', 'query_prefix', 'query_image_size')},
+                      ('backend', 'model', 'dim', 'query_prefix', 'query_image_size')},
         'source_chars': cfg.source_chars, 'context_chars': cfg.context_chars,
         'list_context_chars': cfg.list_context_chars,
         'retrieval': asdict(settings.retrieval), 'router': asdict(settings.router),

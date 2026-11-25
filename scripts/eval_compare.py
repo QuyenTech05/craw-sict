@@ -1,26 +1,23 @@
-"""So sánh truy xuất BM25 vs jina-clip-v2 vs BAAI/bge-m3 trên 12 câu hỏi kiểm thử (D24).
+"""So sánh BM25 và jina-clip-v2 API trên 12 câu hỏi kiểm thử (D24).
 
 Ba bước, mỗi bước chạy riêng (embed rất nặng trên CPU, chạy nền; có checkpoint nên chạy lại tiếp tục):
 
   corpus  Dựng corpus THU GỌN: chunk của tài liệu đáp án (PDF chunk theo trang — số trang thật) + chunk gây
-          nhiễu lấy ngẫu nhiên từ artifact v2 (+ vài PDF nhiều trang khác) + ảnh của câu hỏi thị giác + ảnh nhiễu.
-          Cùng một corpus cho cả ba phương pháp.  (CPU nhẹ, không cần ML)
-  embed   Nhúng chunk / câu hỏi / ảnh (CPU). jina-clip-v2 chạy bằng ONNX Runtime (đường tự host của D22): câu hỏi
-          thêm tiền tố query, chunk/ảnh không tiền tố (cờ phía query/document); bge-m3 không cần tiền tố.
-          Cần ML + onnxruntime (image worker).
+          nhiễu lấy ngẫu nhiên từ artifact v3 (+ vài PDF nhiều trang khác) + ảnh của câu hỏi thị giác + ảnh nhiễu.
+  embed   Nhúng chunk / câu hỏi / ảnh qua HTTP embed gateway (Jina CLIP v2 ONNX int8).
   score   Tính Recall@1/5/10, MRR@10 (mức tài liệu), Recall mức TRANG (PDF), mức ảnh (câu thị giác); ghi
           compare_q12.json + COMPARE.md.
 
   python scripts/eval_compare.py corpus --out eval/results/compare
-  python scripts/eval_compare.py embed  --out eval/results/compare --model jina
-  python scripts/eval_compare.py embed  --out eval/results/compare --model bge-m3
+  uv run python scripts/eval_compare.py embed  --out eval/results/compare
   python scripts/eval_compare.py score  --out eval/results/compare
 
-Không ghi PG / Qdrant / S3; không gọi API ngoài (chỉ tải model từ HF khi `embed`).
+Không ghi PG / Qdrant / S3. Embed gọi endpoint cấu hình trong EMBED_API_BASE.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import re
@@ -36,8 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from eval_retrieval import BM25, norm_url, rrf  # noqa: E402
 
-SNAP = Path("_snapshot/2026-10-12")
-ART = SNAP / "artifacts/v2-multilingual-e5-small"
 KS = (1, 5, 10)
 
 
@@ -49,6 +44,11 @@ def _write(p: Path, rows: list[dict]) -> None:
     p.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
 
 
+def _input_hash(items: list) -> str:
+    raw = json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 # ------------------------------------------------------------------ corpus
 def cmd_corpus(a) -> None:
     from sict_crawler.core.config import get_settings
@@ -56,17 +56,19 @@ def cmd_corpus(a) -> None:
     from sict_crawler.service.index import indexing as ix
 
     out = Path(a.out)
+    snap = Path(a.snapshot)
+    art = Path(a.artifacts) if a.artifacts else snap / "artifacts/v3-jina-clip-v2"
     out.mkdir(parents=True, exist_ok=True)
     rnd = random.Random(a.seed)
     qs = _read(Path(a.questions))
     targets = {u for q in qs for u in q["expected_urls"]}
-    docs = {d["url"]: d for d in _read(ART / "documents.jsonl")}
+    docs = {d["url"]: d for d in _read(art / "documents.jsonl")}
     ch = get_settings().chunking
     ch.structured, ch.semantic = True, False            # chunk file theo trang (D24)
 
     def paged(url: str) -> list[dict]:
         d = docs[url]
-        pages, st = ix.extract_file_pages(SNAP / d["file_path"], ocr_scanned=False)
+        pages, st = ix.extract_file_pages(snap / d["file_path"], ocr_scanned=False)
         if st != "ok":
             return []
         return [C.chunk_row(c) for c in C.doc_chunks(d, "\n\n".join(t for _, t in pages), False, pages=pages)]
@@ -83,13 +85,13 @@ def cmd_corpus(a) -> None:
         for r in paged(u):
             add(r, True)
     web_targets = targets - set(attach_targets)
-    chunks = _read(ART / "chunks.jsonl")
+    chunks = _read(art / "chunks.jsonl")
     for r in chunks:
         if r["url"] in web_targets:
             add(r, True)
     # PDF nhiều trang khác làm nhiễu (có số trang thật)
     pdfs = [u for u, d in docs.items() if d.get("doc_type") == "attachment" and u not in targets
-            and ix.sniff_format(SNAP / d["file_path"]) == "pdf"]
+            and ix.sniff_format(snap / d["file_path"]) == "pdf"]
     rnd.shuffle(pdfs)
     paged_extra = 0
     for u in pdfs:
@@ -107,9 +109,9 @@ def cmd_corpus(a) -> None:
 
     # ---- ảnh: ảnh trong tài liệu của câu thị giác + ảnh nhiễu (cùng ảnh có thể nằm trong nhiều bài)
     img_docs = {u for q in qs for u in q.get("expected_image_docs", [])}
-    images = {r["sha256"]: r for r in _read(SNAP / "artifacts/v2-multilingual-e5-small/images.jsonl")}
+    images = {r["sha256"]: r for r in _read(art / "images.jsonl")}
     caps: dict[str, list[dict]] = defaultdict(list)
-    for c in _read(ART / "captions_image.jsonl"):
+    for c in _read(art / "captions_image.jsonl"):
         caps[c["sha256"]].append(c)
     want = [s for s, cs in caps.items() if s in images and any(c["url"] in img_docs for c in cs)]
     rest = [s for s in caps if s in images and s not in set(want)]
@@ -124,96 +126,54 @@ def cmd_corpus(a) -> None:
     (out / "manifest.json").write_text(json.dumps({
         "chunks": len(rows), "target_chunks": sum(r["target"] for r in rows), "pdf_chunks": sum(r["page"] is not None for r in rows),
         "images": len(irows), "target_images": len(want), "seed": a.seed, "questions": a.questions,
+        "snapshot": str(snap), "artifacts": str(art),
         "avg_chars": sum(len(r["text"]) for r in rows) / max(1, len(rows))}, indent=2), encoding="utf-8")
     print((out / "manifest.json").read_text())
 
 
-class JinaOnnx:
-    """jina-clip-v2 qua ONNX Runtime CPU. Graph gộp hai tháp (input_ids, pixel_values → 4 đầu ra); mỗi lượt chỉ
-    yêu cầu đầu ra cần dùng nên ORT chỉ chạy tháp tương ứng, tháp kia nhận đầu vào giả."""
-
-    def __init__(self, rel_path: str, max_length: int, threads: int):
-        import onnxruntime as ort
-        from huggingface_hub import snapshot_download
-        from tokenizers import Tokenizer
-        root = Path(snapshot_download("jinaai/jina-clip-v2", allow_patterns=[rel_path, rel_path + "_data", "tokenizer.json",
-                                                                              "preprocessor_config.json"]))
-        so = ort.SessionOptions()
-        so.intra_op_num_threads = threads
-        self.sess = ort.InferenceSession(str(root / rel_path), so, providers=["CPUExecutionProvider"])
-        outs = [o.name for o in self.sess.get_outputs()]
-        self.out_text = next(n for n in outs if "text" in n and "l2norm" in n)
-        self.out_image = next(n for n in outs if "image" in n and "l2norm" in n)
-        self.tok = Tokenizer.from_file(str(root / "tokenizer.json"))
-        self.tok.enable_truncation(max_length)
-        self.tok.enable_padding(pad_id=1, pad_token="<pad>")
-        pc = json.loads((root / "preprocessor_config.json").read_text())
-        self.size = pc.get("size", {}).get("shortest_edge", 512) if isinstance(pc.get("size"), dict) else int(pc.get("size", 512))
-        self.mean, self.std = np.array(pc["mean"], np.float32), np.array(pc["std"], np.float32)
-        print("onnx IO:", [(i.name, i.shape) for i in self.sess.get_inputs()], outs, flush=True)
-
-    def encode_text(self, texts: list[str], batch: int) -> np.ndarray:
-        out = []
-        for s in range(0, len(texts), batch):
-            ids = np.array([e.ids for e in self.tok.encode_batch(texts[s:s + batch])], dtype=np.int64)
-            dummy = np.zeros((len(ids), 3, self.size, self.size), np.float32)   # batch phải bằng nhau; tháp ảnh không chạy
-            out.append(self.sess.run([self.out_text], {"input_ids": ids, "pixel_values": dummy})[0])
-        return np.concatenate(out)
-
-    def _prep(self, im) -> np.ndarray:
-        from PIL import Image
-        im = im.convert("RGB")
-        w, h = im.size
-        sc = self.size / min(w, h)
-        im = im.resize((max(self.size, round(w * sc)), max(self.size, round(h * sc))), Image.BICUBIC)
-        w, h = im.size
-        l, t = (w - self.size) // 2, (h - self.size) // 2
-        a = (np.asarray(im.crop((l, t, l + self.size, t + self.size)), np.float32) / 255.0 - self.mean) / self.std
-        return a.transpose(2, 0, 1)
-
-    def encode_image(self, ims: list, batch: int) -> np.ndarray:
-        out = []
-        for s in range(0, len(ims), batch):
-            px = np.stack([self._prep(i) for i in ims[s:s + batch]])
-            ids = np.ones((len(px), 4), dtype=np.int64)                          # tháp chữ không chạy
-            out.append(self.sess.run([self.out_image], {"input_ids": ids, "pixel_values": px})[0])
-        return np.concatenate(out)
-
-
 # ------------------------------------------------------------------ embed
 def cmd_embed(a) -> None:
-    import torch
+    from sict_crawler.core.config import get_settings
+    from sict_crawler.service.embedding import embedder
+
     out = Path(a.out)
-    torch.set_num_threads(a.threads or torch.get_num_threads())
+    snap = Path(a.snapshot)
+    settings = get_settings().embedding
     qs = _read(Path(a.questions))
     corpus = _read(out / "corpus.jsonl")
     images = _read(out / "images.jsonl")
     chunk_texts = [r["text"] for r in corpus] + [r["text"] for r in images]      # chunk + caption ảnh (dạng chữ)
-    stats = {"model": a.model, "max_length": a.max_length, "threads": torch.get_num_threads()}
-    t0 = time.time()
-    if a.model == "jina":
-        # ONNX Runtime (đúng đường tự host dự định ở D22): query thêm tiền tố tay, chunk/ảnh không tiền tố
-        m = JinaOnnx(a.onnx, a.max_length, a.threads or torch.get_num_threads())
-        prefix = a.query_prefix
-        encode_docs = lambda t: m.encode_text(t, a.batch)                          # noqa: E731  phía document
-        encode_queries = lambda t: m.encode_text([prefix + x for x in t], a.batch)  # noqa: E731  phía query
-    else:
-        from sentence_transformers import SentenceTransformer
-        m = SentenceTransformer("BAAI/bge-m3", device="cpu")
-        m.max_seq_length = a.max_length
-        encode_docs = encode_queries = lambda t: m.encode(t, batch_size=a.batch, normalize_embeddings=True)  # noqa: E731
-    stats["load_s"] = round(time.time() - t0, 1)
+    stats = {"model": settings.model, "dim": settings.dim, "backend": "api", "api_base": settings.api_base}
 
-    def run(name: str, texts: list[str], fn, step: int = 32):
+    def run(name: str, texts: list[str], fn, step: int = 32, cache_inputs: list | None = None):
         """Nhúng theo đoạn, sắp theo độ dài (ít padding), checkpoint sau mỗi đoạn → chạy lại tiếp tục."""
-        path = out / f"vec_{a.model}_{name}.npy"
+        path = out / f"vec_jina_api_{name}.npy"
+        metadata_path = out / f"vec_jina_api_{name}.meta.json"
+        metadata = {
+            "input_sha256": _input_hash(cache_inputs if cache_inputs is not None else texts),
+            "model": settings.model, "dim": settings.dim, "backend": settings.backend,
+            "api_base": settings.api_base, "kind": name, "count": len(texts),
+        }
+        if metadata_path.exists():
+            saved_metadata = json.loads(metadata_path.read_text())
+            if saved_metadata != metadata:
+                raise ValueError(f"Cache {name} không khớp corpus/model/endpoint hiện tại; xóa các file vec_jina_api_{name}.*")
         if path.exists():
-            print(f"[{a.model}] {name}: đã có"); return np.load(path)
+            if not metadata_path.exists():
+                raise ValueError(f"Cache {name} thiếu metadata; xóa {path} rồi nhúng lại")
+            vectors = np.load(path)
+            if vectors.shape != (len(texts), settings.dim):
+                raise ValueError(f"Cache {name} có shape {vectors.shape}, chờ ({len(texts)}, {settings.dim})")
+            print(f"[jina-api] {name}: đã có"); return vectors
         order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
-        part = out / f"vec_{a.model}_{name}.partial.npz"
+        part = out / f"vec_jina_api_{name}.partial.npz"
         done = {}
         if part.exists():
-            z = np.load(part); done = dict(zip(z["idx"].tolist(), z["vec"]))
+            if not metadata_path.exists():
+                raise ValueError(f"Checkpoint {name} thiếu metadata; xóa {part} rồi nhúng lại")
+            with np.load(part) as z:
+                done = dict(zip(z["idx"].tolist(), z["vec"]))
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
         t = time.time()
         for s in range(0, len(order), step):
             idx = [i for i in order[s:s + step] if i not in done]
@@ -224,23 +184,27 @@ def cmd_embed(a) -> None:
             done.update(zip(idx, v))
             np.savez(part, idx=np.array(list(done)), vec=np.stack(list(done.values())))
             el = time.time() - t
-            print(f"[{a.model}] {name} {len(done)}/{len(texts)} {el:.0f}s ({el / max(1, len(done)):.2f}s/mục)", flush=True)
-        arr = np.stack([done[i] for i in range(len(texts))])
+            print(f"[jina-api] {name} {len(done)}/{len(texts)} {el:.0f}s ({el / max(1, len(done)):.2f}s/mục)", flush=True)
+        arr = np.stack([done[i] for i in range(len(texts))]) if texts else np.empty((0, settings.dim), dtype=np.float32)
         np.save(path, arr)
         part.unlink(missing_ok=True)
         stats[f"{name}_s"] = round(time.time() - t, 1)
         return arr
 
-    run("queries", [q["question"] for q in qs], encode_queries)
-    run("chunks", chunk_texts, encode_docs)
-    if a.model == "jina":                         # nhánh ảnh: vector ảnh cùng không gian với chữ
-        from PIL import Image
-        def enc_img(paths):
-            return m.encode_image([Image.open(SNAP / p) for p in paths], max(1, a.batch // 2))
-        run("images", [r["path"] for r in images], enc_img, step=16)
+    run("queries", [q["question"] for q in qs], lambda items: embedder.embed_texts(items, kind="query"))
+    run("chunks", chunk_texts, lambda items: embedder.embed_texts(items, kind="passage"))
+
+    def encode_images(paths: list[str]) -> list[list[float]]:
+        vectors, valid = embedder.embed_image_bytes([(snap / p).read_bytes() for p in paths])
+        if valid != list(range(len(paths))):
+            raise ValueError(f"Ảnh corpus bị lỗi, chỉ embed được {len(valid)}/{len(paths)}")
+        return vectors
+
+    run("images", [r["path"] for r in images], encode_images, step=a.batch,
+        cache_inputs=[{"path": r["path"], "sha256": r["sha256"]} for r in images])
     import resource
     stats["max_rss_mb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
-    (out / f"embed_stats_{a.model}.json").write_text(json.dumps(stats, indent=2))
+    (out / "embed_stats_jina_api.json").write_text(json.dumps(stats, indent=2))
     print(stats)
 
 
@@ -266,12 +230,39 @@ def cmd_score(a) -> None:
     texts = [r["text"] for r in corpus]
     cap_texts = [r["text"] for r in images]
     n_c = len(corpus)
+    expected_hashes = {
+        "queries": _input_hash([q["question"] for q in qs]),
+        "chunks": _input_hash(texts + cap_texts),
+        "images": _input_hash([{"path": r["path"], "sha256": r["sha256"]} for r in images]),
+    }
+    vector_source = None
+    for name in ("queries", "chunks", "images"):
+        vector_path = out / f"vec_jina_api_{name}.npy"
+        if not vector_path.exists():
+            continue
+        metadata_path = out / f"vec_jina_api_{name}.meta.json"
+        if not metadata_path.exists():
+            raise ValueError(f"Vector {name} thiếu metadata, cần nhúng lại để tránh dùng nhầm cache")
+        metadata = json.loads(metadata_path.read_text())
+        if metadata.get("input_sha256") != expected_hashes[name] or metadata.get("count") != (
+            len(qs) if name == "queries" else len(texts) + len(cap_texts) if name == "chunks" else len(images)
+        ):
+            raise ValueError(f"Vector {name} không khớp input hiện tại, cần nhúng lại")
+        source = (metadata.get("model"), metadata.get("dim"), metadata.get("backend"), metadata.get("api_base"))
+        if source[0] not in ("jina-clip-v2", "jinaai/jina-clip-v2") or source[1] != 1024 or source[2] != "api" or not source[3]:
+            raise ValueError(f"Vector {name} không phải embedding API jina-clip-v2 1024-d hợp lệ")
+        if vector_source is not None and source != vector_source:
+            raise ValueError(f"Vector {name} dùng model/endpoint khác các vector còn lại, cần nhúng lại")
+        vector_source = source
+        expected_shape = (metadata["count"], metadata["dim"])
+        if np.load(vector_path, mmap_mode="r").shape != expected_shape:
+            raise ValueError(f"Vector {name} sai shape; chờ {expected_shape}, cần nhúng lại")
     bm_c, bm_i = BM25(texts), BM25(cap_texts)
     S: dict[str, dict[str, list[np.ndarray]]] = {"chunks": {}, "images": {}}     # method → [điểm / câu]
     S["chunks"]["bm25"] = [bm_c.scores(q["question"]) for q in qs]
     S["images"]["bm25 (caption)"] = [bm_i.scores(q["question"]) for q in qs]
     have = []
-    for model, label in (("jina", "jina-clip-v2"), ("bge-m3", "bge-m3")):
+    for model, label in (("jina_api", "jina-clip-v2 (API)"),):
         qp, cp = out / f"vec_{model}_queries.npy", out / f"vec_{model}_chunks.npy"
         if not (qp.exists() and cp.exists()):
             print(f"thiếu vector {model} — bỏ qua"); continue
@@ -279,9 +270,9 @@ def cmd_score(a) -> None:
         Q, Cv = np.load(qp), np.load(cp)
         S["chunks"][label] = [Cv[:n_c] @ q for q in Q]
         S["images"][f"{label} (caption)"] = [Cv[n_c:] @ q for q in Q]
-        if model == "jina" and (out / "vec_jina_images.npy").exists():
-            Iv = np.load(out / "vec_jina_images.npy")
-            S["images"]["jina-clip-v2 (ảnh)"] = [Iv @ q for q in Q]
+        if (out / "vec_jina_api_images.npy").exists():
+            Iv = np.load(out / "vec_jina_api_images.npy")
+            S["images"]["jina-clip-v2 (API, ảnh)"] = [Iv @ q for q in Q]
     for _, label in have:                         # hybrid tham khảo: BM25 + dense (RRF)
         S["chunks"][f"bm25+{label}"] = [None] * len(qs)
     methods = list(S["chunks"])
@@ -347,14 +338,15 @@ def cmd_score(a) -> None:
     res["methods"]["image (2 câu thị giác)"] = {m: _metrics(r) for m, r in rows_img.items()}
     man = json.loads((out / "manifest.json").read_text())
     res["corpus"] = man
-    res["embed"] = {f.stem.replace("embed_stats_", ""): json.loads(f.read_text()) for f in out.glob("embed_stats_*.json")}
+    stats_path = out / "embed_stats_jina_api.json"
+    res["embed"] = {"jina_api": json.loads(stats_path.read_text())} if stats_path.exists() else {}
     (out.parent / "compare_q12.json").write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
     (out.parent / "COMPARE.md").write_text(_markdown(res, qs), encoding="utf-8")
     print((out.parent / "COMPARE.md").read_text())
 
 
 def _markdown(res: dict, qs: list[dict]) -> str:
-    L = ["# So sánh truy xuất: BM25 vs jina-clip-v2 vs bge-m3 (12 câu, corpus thu gọn)", "",
+    L = ["# So sánh truy xuất: BM25 vs jina-clip-v2 API (12 câu, corpus thu gọn)", "",
          f"Corpus: {res['corpus']['chunks']} chunk ({res['corpus']['target_chunks']} chunk của tài liệu đáp án, "
          f"{res['corpus']['pdf_chunks']} chunk PDF theo trang), {res['corpus']['images']} ảnh "
          f"({res['corpus']['target_images']} ảnh của câu thị giác). Câu hỏi: `eval/compare_q12.jsonl` (assistant soạn, draft). "
@@ -388,19 +380,16 @@ def main() -> None:
         p = sub.add_parser(name)
         p.add_argument("--out", default="eval/results/compare")
         p.add_argument("--questions", default="eval/compare_q12.jsonl")
+        if name in ("corpus", "embed"):
+            p.add_argument("--snapshot", default="_snapshot/2026-10-12")
         if name == "corpus":
+            p.add_argument("--artifacts", help="Đường dẫn artifact v3, mặc định <snapshot>/artifacts/v3-jina-clip-v2")
             p.add_argument("--distractors", type=int, default=1200)
             p.add_argument("--extra-pdfs", type=int, default=6)
             p.add_argument("--distractor-images", type=int, default=300)
             p.add_argument("--seed", type=int, default=0)
         if name == "embed":
-            p.add_argument("--model", choices=("jina", "bge-m3"), required=True)
-            p.add_argument("--max-length", type=int, default=384)
-            p.add_argument("--batch", type=int, default=8)
-            p.add_argument("--threads", type=int, default=0)
-            p.add_argument("--onnx", default="onnx/model.onnx", help="jina: đường dẫn graph ONNX (fp32 hoặc int8) trong HF cache")
-            p.add_argument("--query-prefix", default="Represent the query for retrieving evidence documents: ",
-                           help="jina: tiền tố phía query (ONNX không có LoRA task)")
+            p.add_argument("--batch", type=int, default=8, help="Số ảnh mỗi checkpoint (HTTP client tự chia lô chữ)")
     a = ap.parse_args()
     {"corpus": cmd_corpus, "embed": cmd_embed, "score": cmd_score}[a.cmd](a)
 
