@@ -52,7 +52,11 @@ def media_sources(image_hits: list[dict]) -> list[Source]:
     chung nhiều bài) → lấy bài đầu; video caption → kind video, media_key = khung hình đầu."""
     return [Source(
         url=r.get("url", ""), title=r.get("title", ""), kind=r.get("kind", "image"),
-        score=r["score"], excerpt=r.get("caption", r.get("s3_key", "")), content=r.get("caption") or "",
+        score=r["score"], excerpt=r.get("caption") or r.get("s3_key") or "",
+        content=("\n".join(dict.fromkeys(str(r[field]).strip() for field in
+                 ("caption", "ocr_text", "subtitle") if r.get(field)))
+                 if r.get("evidence_verified") else r.get("caption") or ""),
+        evidence_verified=bool(r.get("evidence_verified")),
         media_id=r.get("media_id"), media_key=r.get("media_key"), timestamp=r.get("timestamp"),
         published_at=r.get("published_at"), section=_first(r.get("section")),
         parent_url=r.get("page_url") or _first(r.get("page_urls")), via=r.get("modality"),

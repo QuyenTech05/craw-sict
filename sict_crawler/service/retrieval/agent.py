@@ -156,6 +156,10 @@ def _validate_step(question, state):
         log.append(f"media: bỏ {before - len(msrcs)} ảnh/video không gắn bài chữ (thiếu bằng chứng)")
         ctx = sources.build_context(tsrcs, msrcs, context_chars=budget,
                                     media_first=bool(route and route.media == "required"))
+    if (get_settings().retrieval.planner_mode == "candidate" and route is not None
+            and route.media == "required" and not msrcs):
+        ev = {**ev, "sufficient": False, "reason": "không tìm thấy media phù hợp"}
+        log.append(f"evidence: {ev}")
     return _result(tsrcs, msrcs, ctx, state["attempts"], ev["sufficient"], log, route, note)
 
 
@@ -174,8 +178,11 @@ def validate(question: str, tsrcs: list, msrcs: list, ctx: str, ev: dict, route)
 
     note = None
     if not ev.get("sufficient") and msrcs:
+        allow_independent = (get_settings().retrieval.planner_mode == "candidate"
+                             and getattr(route, "media", None) == "required")
         msrcs = _router.supported_media(msrcs, tsrcs, get_settings().router.optional_top_docs,
-                                        bool(getattr(route, "wants_video", False)))
+                                        bool(getattr(route, "wants_video", False)),
+                                        allow_independent=allow_independent)
         if route is not None and not msrcs:
             route.outputs = [x for x in (getattr(route, "outputs", None) or []) if x != "image"]
     if route is not None and route.media == "required" and not msrcs:

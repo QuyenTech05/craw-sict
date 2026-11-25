@@ -31,4 +31,5 @@ class Source(BaseModel):
     # D27: nội dung đầy đủ của đoạn cho ngữ cảnh LLM (excerpt chỉ 300 ký tự để hiển thị). Có trong cache truy vấn,
     # không trả qua HTTP (routes bỏ trường này — RESPONSE_EXCLUDE).
     content: str = ""
+    evidence_verified: bool = False  # xác minh provenance nội bộ, chỉ dùng cho candidate media gate
     cosine: float | None = None             # D27: cosine câu hỏi↔đoạn (raw_score) — tín hiệu "đủ bằng chứng"

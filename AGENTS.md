@@ -8,6 +8,18 @@ commit messages are mostly Vietnamese; keep that convention.
 
 ## Hard rules (do not violate)
 
+- **Giới hạn tài liệu agent:** giữ mỗi tệp `AGENTS.md` / `AGENT.md` không quá 190 dòng; khi sửa,
+  kiểm tra số dòng và chuyển nội dung chi tiết sang tài liệu liên kết nếu cần.
+- **RAGAS golden dataset (owner, 2026-11-21):** luôn dùng bộ golden mới nhất được chủ chỉ định để đo
+  RAGAS. Hiện tại là `eval/multimodal_v1.jsonl` (150 câu, gồm input ảnh + chữ; trạng thái draft).
+  Truyền ảnh đầu vào thật khi collect; báo số mẫu và lý do không chấm được từng chỉ số, không gộp
+  các mẫu bị loại vào điểm trung bình. Các bộ cũ chỉ chạy bổ sung để đối chiếu, không thay bộ mới
+  trong kết quả RAGAS chính; nếu bộ mới thay đổi, xác nhận phiên bản và ghi rõ trong báo cáo.
+- **RAGAS dưới ngưỡng phải truy vết nguyên nhân:** nếu Context Precision < 0,91, Answer Relevancy < 0,91
+  hoặc chỉ số nghiệm thu khác chưa đạt, phân tích từng câu bị điểm thấp và kiểm tra lần lượt input/ảnh,
+  embedding, retrieval (dense/BM25/rerank), nguồn và thứ tự context, OCR/media, prompt, câu trả lời LLM
+  và lỗi/giới hạn của giám khảo. Ghi bằng chứng, nguyên nhân gốc, số câu ảnh hưởng và chỉ số trước/sau;
+  chỉ kết luận cải thiện sau khi đo lại toàn bộ golden mới nhất và kiểm tra các chỉ số không bị tụt.
 - **S3 / VM freeze (owner, 2026-10-14):** never upload to S3 and never run anything on the VMs
   (CD workflow, `scripts/cutover_v3.sh` VM steps, `loader --upload-media`) unless the owner explicitly
   says so. `upload-media` also requires `CONFIRM_S3_UPLOAD=yes`. Local runs use the local store (no AWS env).

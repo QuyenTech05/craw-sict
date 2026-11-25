@@ -59,7 +59,7 @@ _MEDIA_TTL = 86400    # bytes ảnh theo media_id (≤1MB mới cache)
 _MEDIA_MAX = 1_000_000
 
 
-RESPONSE_EXCLUDE = {"content"}   # D27: nội dung đầy đủ chỉ dùng cho ngữ cảnh LLM, HTTP trả excerpt
+RESPONSE_EXCLUDE = {"content", "evidence_verified"}   # trường nội bộ chỉ dùng cho agent/context
 IMAGE_ONLY_QUESTION = "Người dùng gửi một ảnh, không kèm câu hỏi. Hãy cho biết thông tin liên quan đến ảnh này."
 
 

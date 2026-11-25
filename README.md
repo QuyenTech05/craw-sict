@@ -8,7 +8,7 @@ tách chữ, bảng, ảnh, keyframe video, file đính kèm → PostgreSQL + Qd
 Hỏi được bằng chữ, bằng ảnh, hoặc cả hai; câu trả lời có trích dẫn `[n]` trỏ về bài viết / file
 (kèm số trang) và ảnh, video liên quan khi câu hỏi cần.
 
-**Bản chạy thật:** <http://mmsict.linkpc.net> — API + giao diện chat (hai VM EC2, Docker + GitHub
+**Bản chạy thật:** <https://mmsict.linkpc.net/> — API + giao diện chat (hai VM EC2, Docker + GitHub
 Actions CI/CD).
 
 > Dự án đang ở giai đoạn production hardening. Mọi quyết định thiết kế (D1–D33), lộ trình và cách
@@ -228,7 +228,7 @@ chưa đạt) ở `eval/RESULTS.md` và `eval/results/`; điểm RAGAS từng l�
 
 ## Triển khai
 
-Bản chạy thật: **<http://mmsict.linkpc.net>** (nginx :80 / :8080 trên VM1 → API :8003).
+Bản chạy thật: **<https://mmsict.linkpc.net/>** (nginx HTTPS :443 / :8080 trên VM1 → API :8003).
 
 Hai VM, Docker Compose (không k8s, D15):
 

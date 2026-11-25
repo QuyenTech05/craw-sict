@@ -327,6 +327,29 @@ class RetrievalConfig:
     # live (2026-11-10): 0,55 flag 11/80 (0 chặn nhầm), 0,63 flag 28 (21 chặn nhầm), 0,75 flag 72 (62
     # chặn nhầm — cosine câu ĐÚNG rải dày 0,58–0,72) → chủ duyệt giữ 0,55. 0 = tắt.
     weak_top_cosine: float = 0.55
+    # Retrieval upgrade: tất cả tính năng mới mặc định tắt để giữ nguyên baseline.
+    planner_mode: str = "baseline"          # baseline | shadow | candidate
+    entity_index_enabled: bool = False
+    entity_alias_path: str = ""              # artifact do owner kiểm duyệt, không chứa PII tự sinh
+    entity_alias_min_confidence: float = 0.85
+    entity_hard_filter_min_confidence: float = 0.95
+    entity_max_ambiguity: int = 1
+    entity_allow_ner: bool = False
+    entity_allow_llm_fallback: bool = False
+    entity_llm_timeout_ms: int = 1200
+    graph_route_on_relation: bool = True
+    graph_route_on_complexity: bool = True
+    graph_hard_filter: bool = False
+    text_candidate_limit: int = 50
+    media_candidate_limit: int = 32
+    max_retrieval_calls: int = 20
+    rerank_profile: str = "baseline_rrf"
+    rerank_top_n: int = 50
+    rerank_timeout_ms: int = 150
+    media_coupled_optional: bool = False
+    media_first_enabled: bool = False
+    parallel_multimodal_enabled: bool = False
+    audio_retrieval_enabled: bool = False
 
 
 @dataclass

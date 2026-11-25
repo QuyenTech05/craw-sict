@@ -303,7 +303,8 @@ def gate(route: Route, top_text_hits: list[dict], candidates: list[dict], top_k:
     return [{k: v for k, v in h.items() if k not in ("_coupled", "_rank")} for h in kept[:cap]]
 
 
-def supported_media(media: list, text: list, n_top: int, wants_video: bool = False) -> list:
+def supported_media(media: list, text: list, n_top: int, wants_video: bool = False,
+                    allow_independent: bool = False) -> list:
     """C (2026-11-05): `sufficient` False (agent.evidence) → chỉ giữ media thuộc `n_top` nguồn chữ đứng đầu
     (`parent_url` ∈ url / parent_url của chúng; gate đặt `page_url` của ảnh gắn = url bài đó), đúng loại được hỏi (câu
     đòi video → chỉ video), và ảnh giống ảnh người dùng gửi (`via` i2i). Chữ yếu thì ảnh không gắn với bài nào chỉ là
@@ -317,5 +318,9 @@ def supported_media(media: list, text: list, n_top: int, wants_video: bool = Fal
         if getattr(m, "via", None) == "i2i":
             out.append(m)
         elif getattr(m, "parent_url", None) in top and (not wants_video or (getattr(m, "kind", "") or "").startswith("video")):
+            out.append(m)
+        elif (allow_independent and getattr(m, "evidence_verified", False)
+              and getattr(m, "parent_url", None) and (getattr(m, "content", "") or "").strip()
+              and (not wants_video or (getattr(m, "kind", "") or "").startswith("video"))):
             out.append(m)
     return out
