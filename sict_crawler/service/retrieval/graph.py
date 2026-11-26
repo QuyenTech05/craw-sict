@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Callable
 
 from typing_extensions import TypedDict
 
@@ -14,6 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from sict_crawler.core.config import get_settings
 from sict_crawler.model.schemas import Source
 from sict_crawler.repository import cache
+from sict_crawler.service.embedding.embedder import EmbedError
 from sict_crawler.service.retrieval import hybrid_router, retriever, router
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class RetrievalState(TypedDict, total=False):
     retry: bool
     cache_key: str
     cache_hit: bool
+    postprocess_result: Callable[[dict], dict]
 
 
 
@@ -157,7 +159,7 @@ def _answer_events(question: str, image: str | None, result: dict):
     from sict_crawler.service.retrieval import citations, vlm
     text, media, context = result['text'], result['media'], result['context']
     status_fields = ('attempts', 'sufficient', 'media_mode', 'wants_file', 'media_note',
-                     'list_question', 'entities', 'inputs', 'outputs')
+                     'list_question', 'entities', 'inputs', 'outputs', 'ocr')
     yield {'status': {key: result.get(key) for key in status_fields}}
     yield {'text': [source.model_dump(exclude={'content'}) for source in text],
            'media': [source.model_dump(exclude={'content'}) for source in media]}
@@ -195,7 +197,10 @@ def _answer_events(question: str, image: str | None, result: dict):
 def _answer(state: RetrievalState) -> dict:
     from langgraph.config import get_stream_writer
     writer = get_stream_writer()
-    for event in _answer_events(state['question'], state.get('image'), state['result']):
+    result = state['result']
+    if state.get('postprocess_result'):
+        result = state['postprocess_result'](result)
+    for event in _answer_events(state['question'], state.get('image'), result):
         writer(event)
     return {}
 
@@ -234,6 +239,8 @@ def run(question: str, top_k: int, image: str | None, filters: dict | None) -> d
     try:
         return _graph.invoke({'question': question, 'top_k': top_k, 'image': image,
                               'filters': filters}, config={'recursion_limit': 12})['result']
+    except EmbedError:
+        raise
     except Exception:
         # Không gọi lại LLM khi dự phòng; giữ luật và chữ ký API cũ.
         log.exception('Graph lỗi, dùng tuyến luật dự phòng')
@@ -244,15 +251,19 @@ def run(question: str, top_k: int, image: str | None, filters: dict | None) -> d
         return agent._run_linear(question, top_k, image, filters, rules)
 
 
-def stream_chat(question: str, top_k: int, image: str | None, filters: dict | None):
+def stream_chat(question: str, top_k: int, image: str | None, filters: dict | None,
+                postprocess_result: Callable[[dict], dict] | None = None):
     """Sinh sự kiện thật qua graph.stream, giữ đường dự phòng không gọi router LLM lần hai."""
     emitted = False
     try:
         for event in _chat_graph.stream({'question': question, 'top_k': top_k, 'image': image,
-                                         'filters': filters}, config={'recursion_limit': 12},
+                                         'filters': filters,
+                                         'postprocess_result': postprocess_result}, config={'recursion_limit': 12},
                                         stream_mode='custom'):
             emitted = True
             yield event
+    except EmbedError:
+        raise
     except Exception:
         log.exception('Graph chat lỗi')
         if emitted:
@@ -265,4 +276,6 @@ def stream_chat(question: str, top_k: int, image: str | None, filters: dict | No
             if not question.strip() and image:
                 rules = router.Route(media='required', source='image', inputs=['image'])
             result = agent._run_linear(question, top_k, image, filters, rules)
+            if postprocess_result:
+                result = postprocess_result(result)
             yield from _answer_events(question, image, result)

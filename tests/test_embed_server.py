@@ -2,6 +2,7 @@
 Matryoshka, tokenizer bỏ padding 77, hợp đồng HTTP kiểu Jina — không cần model / onnxruntime."""
 import base64
 import io
+import tarfile
 
 import numpy as np
 import pytest
@@ -91,11 +92,16 @@ def test_embed_keeps_input_order():
     assert [int(np.argmax(v)) for v in vecs] == [2, 507, 4] and abs(np.linalg.norm(vecs[0]) - 1) < 1e-6
 
 
-def test_http_contract_matches_embedder_client():
+def test_http_contract_matches_embedder_client(monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
+    monkeypatch.setenv("EMBED_API_KEY", "embed-private-key")
     with TestClient(S.create_app(FakeEncoder())) as c:
         assert c.get("/healthz").json()["ok"] is True
+        assert "requests" not in c.get("/healthz").json()
+        assert c.post("/v1/embeddings", json={"input": "a"}).status_code == 401
+        assert c.get("/metrics").status_code == 401
+        c.headers.update({"Authorization": "Bearer embed-private-key"})
         r = c.post("/v1/embeddings", json={"model": "jina-clip-v2", "normalized": True, "dimensions": 256,
                                            "input": [{"text": "xin chào"}, {"text": "a"}]})
         assert r.status_code == 200
@@ -107,6 +113,15 @@ def test_http_contract_matches_embedder_client():
         m = c.get("/metrics").text                                                # D13: Alloy scrape
         assert 'sict_embed_items_total{kind="text"} 2.0' in m and 'sict_embed_errors_total{code="400"} 2.0' in m
         assert 'sict_embed_request_duration_seconds_count{kind="text"} 1.0' in m
+
+
+def test_embed_server_fails_closed_without_key(monkeypatch):
+    from fastapi.testclient import TestClient
+    monkeypatch.delenv("EMBED_API_KEY", raising=False)
+    with TestClient(S.create_app(FakeEncoder())) as client:
+        assert client.post("/embeddings", json={"input": "hello"}).status_code == 503
+        assert client.get("/metrics").status_code == 503
+        assert client.get("/healthz").status_code == 200
 
 
 def test_quantize_vocab_table_matches_fp32():
@@ -135,6 +150,39 @@ def test_query_waits_neither_for_bulk_nor_user_image():
         q = lanes.take(S.QUERY)
         assert q.acquire(blocking=False)
         q.release()
+
+
+def test_prebuilt_lanes_share_one_onnx_slot():
+    lanes = S.Lanes(1, shared=True)
+    with lanes.take(S.QUERY):
+        assert not lanes.take(S.USER_IMAGE).acquire(blocking=False)
+        assert not lanes.take(S.BULK).acquire(blocking=False)
+    assert lanes.take(S.USER_IMAGE).acquire(blocking=False)
+    lanes.take(S.USER_IMAGE).release()
+
+
+def test_prebuilt_artifacts_fail_fast_and_package(tmp_path, monkeypatch):
+    from scripts import package_embed_prebuilt
+
+    src, built = tmp_path / "source", tmp_path / f"{S.REVISION[:12]}-{S.RECIPE}"
+    src.mkdir()
+    built.mkdir()
+    with pytest.raises(RuntimeError, match="Thiếu artifact ONNX"):
+        S.prebuilt_towers(src, built)
+    for name in ("tokenizer.json", "preprocessor_config.json", "config.json"):
+        (src / name).write_text("{}", encoding="utf-8")
+    for name in ("text.onnx", "image.onnx", "image_336.onnx"):
+        (built / name).write_bytes(b"test artifact")
+    (built / "towers.json").write_text('{"text":"text_embeds","image":"image_embeds"}')
+    assert "image_336" in S.prebuilt_towers(src, built)
+    monkeypatch.setattr(S, "model_dir", lambda: src)
+    monkeypatch.setattr(S, "build_dir", lambda: built)
+    bundle = tmp_path / "artifact.tar"
+    assert len(package_embed_prebuilt.package(bundle)) == 64
+    with tarfile.open(bundle) as archive:
+        names = archive.getnames()
+    assert "sict-source/tokenizer.json" in names
+    assert f"sict-embed/{built.name}/image_336.onnx" in names
 
 
 def test_lane_of_request():

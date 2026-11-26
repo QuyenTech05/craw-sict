@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextvars
 import json
 import logging
 import os
@@ -292,6 +293,8 @@ def _query_image_vec(b64: str | None) -> list[float] | None:
         return None
     try:
         v = embedder.embed_query_image_base64([b64])
+    except embedder.EmbedError:
+        raise
     except Exception:
         return None
     return v[0] if v else None
@@ -480,7 +483,8 @@ def retrieve(question: str, top_k: int = 5,
         except Exception:
             pass
     # ảnh truy vấn (CPU, ~4 s ở 336 px) nhúng trong lúc phần chữ chạy (luật viết tắt, graph, nhúng câu hỏi)
-    ifut = _STAGE_POOL.submit(_query_image_vec, query_image_b64) if query_image_b64 else None
+    ifut = (_STAGE_POOL.submit(contextvars.copy_context().run, _query_image_vec, query_image_b64)
+            if query_image_b64 else None)
     if has_text:
         r = query_rewriter.rewrite(question, allow_llm=False) if route_override is not None else query_rewriter.rewrite(question)
         route = route_override or router.decide(question, r.get("route_llm"), has_image=bool(query_image_b64))

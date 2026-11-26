@@ -6,6 +6,10 @@ Multi-modal RAG crawler for `https://sict.haui.edu.vn/vn` (crawl → PG + Qdrant
 owner decisions (through D33) and is the source of truth when docs and code disagree. Code comments, docs and
 commit messages are mostly Vietnamese; keep that convention.
 
+Repository GitHub hiện tại: `https://github.com/quyentech05/craw-sict`.
+Plan Vercel/Sandbox đang triển khai: `/codex/PLAN_VM_SERVERLESS_NEW_RUNTIME.md`.
+Owner tạm dừng đo RAGAS và benchmark retrieval mới sau khi xác nhận đối chứng parity; chỉ chạy lại khi có chỉ thị.
+
 ## Hard rules (do not violate)
 
 - **Giới hạn tài liệu agent:** giữ mỗi tệp `AGENTS.md` / `AGENT.md` không quá 190 dòng; khi sửa,

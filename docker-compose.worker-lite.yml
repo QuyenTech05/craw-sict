@@ -8,7 +8,7 @@
 #     corpus không đổi → bỏ qua, không rebuild 12h/lần vô ích).
 #   - svc-ocr không có trong file này (chỉ dùng cho collection v1).
 #
-# Chạy: docker compose -f docker-compose.worker-lite.yml up -d
+# Chạy trên batch host riêng: docker compose -f docker-compose.worker-lite.yml --profile batch up -d
 # .env theo .env.worker.example nhưng: CRAWLER_BACKEND=httpx, CRON_MEM_LIMIT=512m,
 #   EMBED_API_BASE=https://api.jina.ai/v1 (Jina Cloud — máy worker không nhốt embed), EMBED_API_KEY=<khóa>.
 x-worker-v3-env: &worker_v3_env
@@ -31,6 +31,7 @@ x-worker-v3-env: &worker_v3_env
 
 services:
   cron:
+    profiles: ["batch"]
     image: ${WORKER_IMAGE:-sict-worker:latest}
     env_file: [{path: .env, required: false}]
     environment:

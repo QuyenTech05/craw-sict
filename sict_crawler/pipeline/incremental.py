@@ -333,7 +333,21 @@ async def _probe_qdrant() -> None:
     await asyncio.to_thread(lambda: vector_store.get_client().get_collections())
 
 
-SERVICE_PROBES = {"postgres": _probe_postgres, "redis": _probe_redis, "qdrant": _probe_qdrant}
+async def _probe_embed() -> None:
+    """Chặn lượt ghi index khi embedding VM2 chưa nạp model."""
+    import httpx
+
+    from sict_crawler.core.config import get_settings
+    url = get_settings().embedding.api_base.rstrip("/").removesuffix("/v1") + "/healthz"
+    async with httpx.AsyncClient(timeout=3) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        if response.json().get("ok") is not True:
+            raise RuntimeError("embedding model chưa sẵn sàng")
+
+
+SERVICE_PROBES = {"postgres": _probe_postgres, "redis": _probe_redis, "qdrant": _probe_qdrant,
+                  "embed": _probe_embed}
 
 
 async def wait_for_services(timeout: float, interval: float = 10.0, probes: dict | None = None) -> list[str]:

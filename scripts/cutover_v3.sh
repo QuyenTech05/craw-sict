@@ -71,7 +71,7 @@ env_check() {   # chỉ báo TÊN biến thiếu / sai; giá trị không bao gi
   case "$role" in
     vm1)
       nonempty EMBED_QUERY_IMAGE_SIZE
-      [ "$(val API_MEM_LIMIT)" = 600m ] || echo "v3: gợi ý API_MEM_LIMIT=600m (API backend api chỉ ~200 MiB; trả RAM cho VM1)"
+      [ "$(val API_MEM_LIMIT)" = 320m ] || echo "v3: gợi ý API_MEM_LIMIT=320m (ngân sách VM-SERVE 2 GiB; cần nghiệm thu thực)"
       ;;
     vm2)
       nonempty EMBED_BIND

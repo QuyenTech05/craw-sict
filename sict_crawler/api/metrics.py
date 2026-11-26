@@ -31,6 +31,8 @@ HTTP_REQUESTS = Counter("sict_http_requests_total", "Số request HTTP của API
                         registry=REGISTRY)
 HTTP_LATENCY = Histogram("sict_http_request_duration_seconds", "Thời gian xử lý request HTTP", ["route", "method"],
                          buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 40, 60, 120), registry=REGISTRY)
+EMBED_FAILURES = Counter("sict_query_embed_failures_total", "Số truy vấn thất bại vì embedding gateway",
+                         ["endpoint"], registry=REGISTRY)
 LAST_OK = Gauge("sict_incremental_last_ok_timestamp_seconds", "Lượt incremental thành công gần nhất (unix)",
                 registry=REGISTRY)
 LAST_ERROR = Gauge("sict_incremental_last_error_timestamp_seconds", "Lượt incremental lỗi gần nhất (unix)",

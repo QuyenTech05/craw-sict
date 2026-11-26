@@ -26,7 +26,7 @@ Khớp với vector cloud / fp32 (index v3 được nhúng bằng 2 nguồn đó
 
 Chạy (cần group `embed`; đã thử local 2026-10-20 trên giới hạn 2 vCPU / 8 GB):
     uv run --group embed python -m sict_crawler.service.embedding.embed_server build      # 1 lần: tải fp32 + tách + lượng tử (~2 phút, RAM ~6 GB)
-    uv run --group embed python -m sict_crawler.service.embedding.embed_server --port 8090   # chưa build thì tự build lúc khởi động
+    uv run --group embed python -m sict_crawler.service.embedding.embed_server --port 8090
     docker compose -f docker-compose.embed.yml up -d --build            # Dockerfile.embed
 Env: EMBED_ONNX_REPO, EMBED_ONNX_REVISION, EMBED_ONNX_DIR (thư mục có sẵn file fp32, bỏ qua tải), EMBED_BUILD_DIR
 (nơi ghi 2 tháp đã lượng tử, mặc định $HF_HOME/sict-embed/<revision>-<quant>), EMBED_QUANT (w8 | fp32),
@@ -34,6 +34,8 @@ EMBED_THREADS (intra-op, mặc định số CPU), EMBED_TEXT_MAX_LEN (2048), EMB
 EMBED_CONCURRENCY (1; lượt chạy ORT cùng lúc mỗi làn — request đơn lẻ của API có làn riêng, xem Lanes),
 EMBED_IMAGE_BATCH (ảnh / 1 lượt chạy ORT), EMBED_MEM_ARENA=1 (bật arena ORT: nhanh hơn chút, RAM giữ đỉnh),
 EMBED_QUERY_IMAGE_SIZES (392; cạnh ảnh truy vấn có tháp riêng — mục ảnh gửi "image_size": N, resize_vision_tower).
+EMBED_REQUIRE_PREBUILT=1: VM-EMBED 4 GiB yêu cầu artifact được dựng ở host RAM >= 6 GiB;
+không tải model, lượng tử hóa hay resize image tower khi khởi động serving.
 """
 import argparse
 import base64
@@ -170,6 +172,11 @@ def model_dir() -> Path:
     from huggingface_hub import snapshot_download
     kw = {"revision": REVISION, "allow_patterns": [
         SRC_FILE, f"{SRC_FILE}_data", "tokenizer.json", "preprocessor_config.json", "config.json"]}
+    if os.environ.get("EMBED_REQUIRE_PREBUILT") == "1":
+        try:
+            return Path(snapshot_download(REPO, local_files_only=True, **kw))
+        except Exception as e:
+            raise RuntimeError("Thiếu model/tokenizer trong HF_HOME; chuẩn bị cache trên host build RAM >= 6 GiB") from e
     try:   # bản đã tải: huggingface_hub mới vẫn gọi API liệt kê file khi có allow_patterns, kể cả HF_HUB_OFFLINE=1
         return Path(snapshot_download(REPO, local_files_only=True, **kw))
     except Exception:   # noqa: BLE001 — chưa có trong cache (lần đầu) → tải
@@ -364,6 +371,30 @@ def build_towers(src: Path, out_dir: Path) -> dict[str, tuple[Path, str]]:
     return {k: (out_dir / f"{k}.onnx", names[k]) for k in names}
 
 
+def prebuilt_towers(src: Path, out_dir: Path) -> dict[str, tuple[Path, str]]:
+    """Chỉ kiểm tra và mở artifact đã build; fail trước mọi thao tác có thể tốn RAM lớn."""
+    if QUANT != "w8":
+        raise RuntimeError("VM-EMBED 4 GiB yêu cầu EMBED_QUANT=w8")
+    required = [src / name for name in ("tokenizer.json", "preprocessor_config.json", "config.json")]
+    required += [out_dir / name for name in ("towers.json", "text.onnx", "image.onnx")]
+    required += [out_dir / f"image_{size}.onnx" for size in QUERY_IMAGE_SIZES]
+    missing = [str(f) for f in required if not f.is_file() or f.stat().st_size == 0]
+    if missing:
+        raise RuntimeError("Thiếu artifact ONNX dựng sẵn trên host RAM >= 6 GiB: " + ", ".join(missing))
+    try:
+        names = json.loads((out_dir / "towers.json").read_text(encoding="utf-8"))
+    except (ValueError, OSError) as e:
+        raise RuntimeError("towers.json không hợp lệ") from e
+    if not isinstance(names, dict) or set(names) != {"text", "image"} or not all(
+        isinstance(names[k], str) and names[k] for k in ("text", "image")
+    ):
+        raise RuntimeError("towers.json phải khai báo tháp text/image và tên output ONNX")
+    towers = {k: (out_dir / f"{k}.onnx", names[k]) for k in ("text", "image")}
+    towers.update({f"image_{size}": (out_dir / f"image_{size}.onnx", names["image"])
+                   for size in QUERY_IMAGE_SIZES})
+    return towers
+
+
 _LANE = threading.local()   # làn của request đang chạy trong luồng này (lane_of)
 QUERY, USER_IMAGE, BULK = 0, 1, 2
 
@@ -384,8 +415,10 @@ class Lanes:
     (~9 s / ảnh, tải 4 luồng: ảnh trung bình 27 s). Câu hỏi (~30 GFLOP) chạy song song chỉ làm lượt khác chậm vài
     trăm ms; RAM cộng thêm nhỏ (1 mục ngắn / 1 ảnh)."""
 
-    def __init__(self, n: int):
-        self.lane = tuple(threading.Semaphore(n) for _ in (QUERY, USER_IMAGE, BULK))
+    def __init__(self, n: int, shared: bool = False):
+        # Máy 4 GiB chỉ cấp một slot chung cho cả query chữ/ảnh, tránh cộng đỉnh RAM ORT từ các làn.
+        semaphore = threading.Semaphore(n) if shared else None
+        self.lane = tuple(semaphore or threading.Semaphore(n) for _ in (QUERY, USER_IMAGE, BULK))
 
     def take(self, lane: int) -> threading.Semaphore:
         return self.lane[lane]
@@ -397,17 +430,23 @@ class Encoder:
 
     def __init__(self, path: Path | None = None, threads: int | None = None):
         import onnxruntime as ort
-        d = path or model_dir()
         out = build_dir()
-        towers = build_towers(d, out)
-        towers.update({f"image_{n}": (f, towers["image"][1]) for n, f in query_towers(d, out).items()})
+        d = path or model_dir()
+        prebuilt = os.environ.get("EMBED_REQUIRE_PREBUILT") == "1"
+        if prebuilt and CONCURRENCY != 1:
+            raise RuntimeError("VM-EMBED 4 GiB yêu cầu EMBED_CONCURRENCY=1")
+        if prebuilt:
+            towers = prebuilt_towers(d, out)
+        else:
+            towers = build_towers(d, out)
+            towers.update({f"image_{n}": (f, towers["image"][1]) for n, f in query_towers(d, out).items()})
         so = ort.SessionOptions()
         so.intra_op_num_threads = threads or int(os.environ.get("EMBED_THREADS", "0")) or (os.cpu_count() or 1)
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         # độ dài chữ đổi mỗi lượt → arena giữ đỉnh cũ và mem pattern vô dụng; tắt để RAM bám theo lượt đang chạy
         so.enable_cpu_mem_arena = os.environ.get("EMBED_MEM_ARENA", "0") == "1"
         so.enable_mem_pattern = False
-        self.slots = Lanes(CONCURRENCY)   # RAM đỉnh cộng dồn theo số lượt chạy cùng lúc
+        self.slots = Lanes(CONCURRENCY, shared=prebuilt)
         self.sess = {k: ort.InferenceSession(str(f), so, providers=["CPUExecutionProvider"])
                      for k, (f, _) in towers.items()}
         self.out = {k: name for k, (_, name) in towers.items()}
@@ -471,6 +510,7 @@ def embed(enc, items: list[dict], dim: int | None) -> tuple[list[list[float]], i
 # ---------------------------------------------------------------- HTTP
 def create_app(enc=None):
     """FastAPI app; enc=None → nạp model lúc khởi động (test truyền encoder giả)."""
+    import hmac
     from fastapi import FastAPI, HTTPException, Request
     from prometheus_client import (
         CONTENT_TYPE_LATEST,
@@ -499,19 +539,28 @@ def create_app(enc=None):
                     state["enc"] = Encoder()
         return state["enc"]
 
+    def require_auth(request: Request) -> None:
+        token = os.getenv("EMBED_API_KEY", "")
+        if not token:
+            raise HTTPException(503, "EMBED_API_KEY chưa được cấu hình")
+        provided = request.headers.get("authorization", "")
+        if not hmac.compare_digest(provided.encode(), ("Bearer " + token).encode()):
+            raise HTTPException(401, "Embedding token không hợp lệ",
+                                headers={"WWW-Authenticate": "Bearer"})
+
     @app.on_event("startup")
     def _load() -> None:
         get_enc()
 
     @app.get("/metrics", include_in_schema=False)
-    def metrics() -> Response:
+    def metrics(request: Request) -> Response:
+        require_auth(request)
         return Response(generate_latest(reg), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/")
     @app.get("/healthz")
     def health() -> dict:
-        return {"ok": state["enc"] is not None, "model": MODEL_NAME, "quant": QUANT,
-                "requests": state["requests"], "items": state["items"]}
+        return {"ok": state["enc"] is not None}
 
     def _embed(body: dict) -> dict:
         try:
@@ -544,6 +593,7 @@ def create_app(enc=None):
     @app.post("/embeddings")
     async def embeddings(request: Request) -> dict:
         from starlette.concurrency import run_in_threadpool
+        require_auth(request)
         return await run_in_threadpool(_embed, await request.json())
 
     return app
@@ -551,13 +601,19 @@ def create_app(enc=None):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="jina-clip-v2 ONNX int8 — API /v1/embeddings kiểu Jina")
-    ap.add_argument("cmd", nargs="?", default="serve", choices=["serve", "build"],
-                    help="build = chỉ tải + tách + lượng tử rồi thoát (chạy trước, RAM ~6 GB)")
+    ap.add_argument("cmd", nargs="?", default="serve", choices=["serve", "build", "verify"],
+                    help="build = tạo artifact (RAM >= 6 GiB); verify = kiểm artifact có sẵn, không nạp model")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8090)
     a = ap.parse_args()
     if a.cmd == "build":
-        print(json.dumps({k: str(f) for k, (f, _) in build_towers(model_dir(), build_dir()).items()}))
+        src, out = model_dir(), build_dir()
+        towers = build_towers(src, out)
+        towers.update({f"image_{n}": (f, towers["image"][1]) for n, f in query_towers(src, out).items()})
+        print(json.dumps({k: str(f) for k, (f, _) in towers.items()}))
+        return
+    if a.cmd == "verify":
+        print(json.dumps({k: str(f) for k, (f, _) in prebuilt_towers(model_dir(), build_dir()).items()}))
         return
     import uvicorn
     uvicorn.run(create_app(), host=a.host, port=a.port, workers=1)

@@ -7,6 +7,7 @@ embed_image_bytes(list[bytes]) → (vecs, ok_idx); embed_image_base64; embed_tex
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import math
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +27,21 @@ from sict_crawler.core.config import get_settings
 
 class EmbedError(RuntimeError):
     """Gọi endpoint embedding thất bại sau khi thử lại. Lỗi cứng: thiếu vector là sai dữ liệu, không bỏ qua."""
+
+
+_query_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "embedding_query_deadline", default=None
+)
+
+
+@contextmanager
+def query_embedding_budget(seconds: float = 25.0):
+    """Giới hạn tổng thời gian nhúng của một truy vấn, độc lập retry của worker/bulk."""
+    token = _query_deadline.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _query_deadline.reset(token)
 
 
 _usage_lock = threading.Lock()
@@ -100,6 +117,9 @@ def _throttle(tokens: int) -> None:
     if not tpm:
         return
     while True:
+        deadline = _query_deadline.get()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise EmbedError("quá thời gian nhúng truy vấn")
         with _sent_lock:
             now = time.time()
             _sent[:] = [(t, n) for t, n in _sent if now - t < 60]
@@ -108,6 +128,8 @@ def _throttle(tokens: int) -> None:
                 _sent.append((now, tokens))
                 return
             wait = 60 - (now - _sent[0][0]) + 0.5
+        if deadline is not None and time.monotonic() + wait >= deadline:
+            raise EmbedError("hạn mức embedding vượt thời gian nhúng truy vấn")
         time.sleep(max(0.5, wait))
 
 
@@ -132,10 +154,19 @@ def _post(items: list[dict]) -> list[list[float]]:
     # hết timeout thì client gửi lại trong khi server vẫn tính lô cũ (chồng việc) → timeout giãn theo khối lượng
     timeout = max(e.timeout, IMAGE_TIMEOUT_S * sum("image" in it for it in items)
                   + TEXT_TIMEOUT_S_PER_KCHAR * sum(len(it.get("text", "")) for it in items) / 1000)
-    for attempt in range(e.api_retries):
+    deadline = _query_deadline.get()
+    attempts = 1 if deadline is not None else e.api_retries
+    for attempt in range(attempts):
         wait = 0.0
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EmbedError("quá thời gian nhúng truy vấn")
+            request_timeout = min(timeout, remaining)
+        else:
+            request_timeout = timeout
         try:
-            r = httpx.post(f"{e.api_base.rstrip('/')}/embeddings", json=body, headers=headers, timeout=timeout)
+            r = httpx.post(f"{e.api_base.rstrip('/')}/embeddings", json=body, headers=headers, timeout=request_timeout)
         except httpx.HTTPError as ex:
             last = f"{type(ex).__name__}: {ex}"
         else:
@@ -158,9 +189,9 @@ def _post(items: list[dict]) -> list[list[float]]:
                 wait = float(r.headers.get("retry-after", ""))
             except ValueError:
                 wait = 60.0 if r.status_code == 429 else 0.0   # giới hạn theo phút: chờ hết cửa sổ
-        if attempt < e.api_retries - 1:
+        if attempt < attempts - 1:
             time.sleep(min(max(wait, 2.0 ** attempt), 90))
-    raise EmbedError(f"embedding endpoint lỗi sau {e.api_retries} lần: {last}")
+    raise EmbedError(f"embedding endpoint lỗi sau {attempts} lần: {last}")
 
 
 def _hf_gradio_request(payload: dict, kind: str, expected: int) -> list[list[float]]:

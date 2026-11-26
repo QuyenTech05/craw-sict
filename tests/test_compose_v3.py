@@ -56,7 +56,7 @@ def test_env_examples_carry_v3_block():
                  "CHUNK_STRUCTURED=1", "EMBED_BIND="):
         assert f"\n{line}" in worker, f".env.worker.example thiếu dòng {line}"
     vm1 = (ROOT / ".env.example").read_text()
-    for k in ("QDRANT_COLLECTION_OCR=sict_ocr_v3", "CHUNK_STRUCTURED=1", "API_MEM_LIMIT=600m"):
+    for k in ("QDRANT_COLLECTION_OCR=sict_ocr_v3", "CHUNK_STRUCTURED=1", "API_MEM_LIMIT=320m"):
         assert k in vm1
 
 
@@ -93,7 +93,7 @@ VM2_STORE = (f"POSTGRES_DSN=postgresql+asyncpg://sict:{SECRET}@10.0.0.5:5432/sic
     ("vm1", "", False),
     ("vm1", VM1_STORE, False),                                                       # store đủ, thiếu v3
     ("vm1", VM1_STORE + V3_BLOCK, False),                                            # thiếu EMBED_QUERY_IMAGE_SIZE
-    ("vm1", VM1_STORE + V3_BLOCK + "EMBED_QUERY_IMAGE_SIZE=336\nAPI_MEM_LIMIT=600m\n", True),
+    ("vm1", VM1_STORE + V3_BLOCK + "EMBED_QUERY_IMAGE_SIZE=336\nAPI_MEM_LIMIT=320m\n", True),
     ("vm1", V3_BLOCK + "EMBED_QUERY_IMAGE_SIZE=336\n", False),                       # v3 đủ, thiếu mật khẩu store
     ("vm1", VM1_STORE + V3_BLOCK.replace("sict_text_v3", "sict_text_v2") + "EMBED_QUERY_IMAGE_SIZE=336\n", False),
     ("vm2", VM2_STORE + V3_BLOCK, False),                                            # thiếu EMBED_BIND
@@ -215,7 +215,7 @@ def test_compose_config_renders_without_env(files):
     args = ["docker", "compose"]
     for f in files:
         args += ["-f", f]
-    r = subprocess.run(args + ["--env-file", os.devnull, "config"], cwd=ROOT, capture_output=True, text=True,
+    r = subprocess.run(args + ["--profile", "batch", "--profile", "manual", "--env-file", os.devnull, "config"], cwd=ROOT, capture_output=True, text=True,
                        timeout=60, env={**os.environ, "HOME": os.environ.get("HOME", "/tmp")})
     assert r.returncode == 0, r.stderr
     if "docker-compose.worker.yml" in files:

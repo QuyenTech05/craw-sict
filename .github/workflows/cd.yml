@@ -1,9 +1,7 @@
 name: CD
-# Deploy tự động khi merge vào main (push) + vẫn giữ chạy tay (workflow_dispatch):
-#   push main → workflow release-images build image GHCR theo SHA → CD chờ image xong rồi deploy cả 2 VM.
-#   Deploy tay: Actions → CD → Run workflow (nhánh main) → target, tag (trống = commit hiện tại của main), embed / alloy tuỳ chọn.
-#   Rollback = chạy lại với tag cũ (VM ghi tag trước vào .env: API_IMAGE_PREV / WORKER_IMAGE_PREV / EMBED_IMAGE_PREV).
-# Push tự động chỉ deploy all/vm1/vm2 mặc định: KHÔNG deploy_embed, KHÔNG deploy_alloy (chỉ bấm tay khi cần).
+# push main → chỉ deploy VM-SERVE. VM-EMBED chỉ chạy khi workflow_dispatch với deploy_embed=true.
+# Không deploy worker/cron/Obscura trên hai máy serving. Batch chạy riêng sau khi owner duyệt.
+# Rollback = chạy lại với SHA v3 cũ, sau khi xác nhận index fingerprint tương thích.
 # Chỉ chạy từ main; job deploy dùng environment `production` (thêm Required reviewers trong Settings → Environments
 # để phải duyệt trước khi chạy — bật qua UI, trigger push vẫn tôn trọng reviewers).
 # Secrets: VM1_HOST, VM1_KEY, VM2_HOST, VM2_KEY (đã có); alloy thêm GCLOUD_HOSTED_METRICS_URL, GCLOUD_HOSTED_METRICS_ID,
@@ -26,7 +24,7 @@ on:
         type: string
         default: ""
       deploy_embed:
-        description: "VM2: dịch vụ embedding ONNX int8 (docker-compose.embed.yml)"
+        description: "VM-EMBED: chỉ khởi động ONNX INT8 với artifact đã dựng sẵn"
         type: boolean
         default: false
       deploy_alloy:
@@ -73,7 +71,7 @@ jobs:
         run: |
           for i in $(seq 1 40); do
             ok=1
-            for img in api worker embed; do
+            for img in api; do
               docker manifest inspect "ghcr.io/${{ github.repository_owner }}/sict-$img:${{ steps.t.outputs.tag }}" >/dev/null || ok=0
             done
             [ "$ok" = 1 ] && exit 0
@@ -83,14 +81,17 @@ jobs:
       - name: "Image của tag phải tồn tại (deploy tay: phải build xong trước)"
         if: github.event_name != 'push'
         run: |
-          for img in api worker embed; do
+          images=()
+          if [[ '${{ inputs.target }}' == 'all' || '${{ inputs.target }}' == 'vm1' ]]; then images+=(api); fi
+          if [[ '${{ inputs.deploy_embed }}' == 'true' && ( '${{ inputs.target }}' == 'all' || '${{ inputs.target }}' == 'vm2' ) ]]; then images+=(embed); fi
+          for img in "${images[@]}"; do
             docker manifest inspect "ghcr.io/${{ github.repository_owner }}/sict-$img:${{ steps.t.outputs.tag }}" >/dev/null \
               || { echo "thiếu ghcr.io/…/sict-$img:${{ steps.t.outputs.tag }} — chờ workflow release-images"; exit 1; }
           done
 
   deploy-vm1:
     needs: prepare
-    # push trigger thì `inputs` rỗng → coi như target=all (deploy cả 2 VM)
+    # push trigger chỉ cập nhật API/stores VM-SERVE
     if: inputs.target == 'all' || inputs.target == 'vm1' || github.event_name == 'push'
     runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
@@ -161,66 +162,9 @@ jobs:
             fi
             docker compose ps --format 'table {{.Name}}\t{{.Image}}\t{{.Status}}'
 
-  deploy-vm2:
-    needs: prepare
-    if: inputs.target == 'all' || inputs.target == 'vm2' || github.event_name == 'push'
-    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 30
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-      - uses: appleboy/scp-action@v1
-        with:
-          host: ${{ secrets.VM2_HOST }}
-          port: ${{ vars.VM2_SSH_PORT || 22 }}
-          username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
-          key: ${{ secrets.VM2_KEY }}
-          source: docker-compose.worker.yml,docker-compose.worker-lite.yml,config.yaml,scripts/monitor_2vm.sh,scripts/store_auth.sh
-          target: ~/craw-sict
-      - name: Pull + up worker (compose `cron` là đường worker DUY NHẤT — D9)
-        uses: appleboy/ssh-action@v1
-        env:
-          WORKER_IMAGE: ghcr.io/${{ github.repository_owner }}/sict-worker:${{ needs.prepare.outputs.tag }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_ACTOR: ${{ github.actor }}
-        with:
-          host: ${{ secrets.VM2_HOST }}
-          port: ${{ vars.VM2_SSH_PORT || 22 }}
-          username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
-          key: ${{ secrets.VM2_KEY }}
-          envs: WORKER_IMAGE,GH_TOKEN,GH_ACTOR
-          command_timeout: 25m
-          script: |
-            set -euo pipefail
-            cd ~/craw-sict
-            [ -f .env ] || { echo "thiếu ~/craw-sict/.env trên VM2 (POSTGRES_DSN/REDIS_URL/QDRANT_HOST trỏ IP private VM1 — xem .env.worker.example)"; exit 1; }
-            grep -qE '^(POSTGRES_DSN|QDRANT_HOST)=' .env || { echo ".env VM2 chưa trỏ về VM1"; exit 1; }
-            bash scripts/store_auth.sh check vm2   # D12: DSN / REDIS_URL có mật khẩu, có QDRANT_API_KEY
-            upsert() { if grep -q "^$1=" .env; then sed -i "s#^$1=.*#$1=$2#" .env; else echo "$1=$2" >> .env; fi; }
-            prev="$(grep '^WORKER_IMAGE=' .env | cut -d= -f2- || true)"
-            [ -n "$prev" ] && [ "$prev" != "$WORKER_IMAGE" ] && upsert WORKER_IMAGE_PREV "$prev"
-            upsert WORKER_IMAGE "$WORKER_IMAGE"
-            # D9: bỏ vòng `docker run` cũ chạy song song với compose cron (2 incremental cùng lúc)
-            docker rm -f sict-worker-24h 2>/dev/null && echo "đã gỡ sict-worker-24h" || true
-            echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
-            compose_file="${{ vars.WORKER_COMPOSE || 'docker-compose.worker.yml' }}"
-            case "$compose_file" in docker-compose.worker.yml|docker-compose.worker-lite.yml) ;; *) exit 2 ;; esac
-            docker compose -f "$compose_file" pull cron
-            docker logout ghcr.io
-            # Named volume mới thuộc root; app uid 10000 cần ghi cache embedding/underthesea.
-            docker compose -f "$compose_file" run --rm --no-deps --user 0 cron sh -c 'mkdir -p /cache/hf; chown 10000:10000 /cache/hf'
-            if [ "$compose_file" = docker-compose.worker-lite.yml ]; then
-              docker compose -f "$compose_file" up -d cron
-            else
-              docker compose -f "$compose_file" up -d obscura cron
-            fi
-            sleep 20
-            docker compose -f "$compose_file" ps --format 'table {{.Name}}\t{{.Image}}\t{{.Status}}'
-            docker compose -f "$compose_file" ps --status running cron | grep -q cron
-
   deploy-embed:
-    needs: [prepare, deploy-vm2]
-    if: always() && needs.prepare.result == 'success' && inputs.deploy_embed == true && (inputs.target == 'all' || inputs.target == 'vm2' || github.event_name == 'push')
+    needs: prepare
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_embed == true && (inputs.target == 'all' || inputs.target == 'vm2')
     runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 75
     environment: production
@@ -234,7 +178,7 @@ jobs:
           key: ${{ secrets.VM2_KEY }}
           source: docker-compose.embed.yml
           target: ~/craw-sict
-      - name: Pull + build model (lần đầu tải fp32 3,5 GB, ~5–15 phút) + up
+      - name: Kiểm artifact ONNX dựng sẵn + up embed
         uses: appleboy/ssh-action@v1
         env:
           EMBED_IMAGE: ghcr.io/${{ github.repository_owner }}/sict-embed:${{ needs.prepare.outputs.tag }}
@@ -254,18 +198,27 @@ jobs:
             prev="$(grep '^EMBED_IMAGE=' .env | cut -d= -f2- || true)"
             [ -n "$prev" ] && [ "$prev" != "$EMBED_IMAGE" ] && upsert EMBED_IMAGE_PREV "$prev"
             upsert EMBED_IMAGE "$EMBED_IMAGE"
+            network="$(grep '^VM2_NETWORK=' .env | cut -d= -f2- || true)"; network="${network:-sict-vm2}"
+            docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network"
+            # VM-EMBED không chịu được cron/OCR/Obscura đồng thời. Chuyển chúng đi là bước migration có approval riêng.
+            if docker ps --format '{{.Names}}' | grep -Eq '(^|[-_])(cron|obscura|svc-ocr)([-_]|$)|^sict-worker-24h$'; then
+              echo 'BLOCKER: VM-EMBED còn cron/Obscura/OCR. Hoàn tất migration batch ngoài serving trước.' >&2
+              exit 1
+            fi
             echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
             docker compose -f docker-compose.embed.yml pull embed
             docker logout ghcr.io
-            docker compose -f docker-compose.embed.yml run --rm embed python -m sict_crawler.service.embedding.embed_server build
+            # preflight chỉ đọc và không nạp model; thiếu ONNX/metadata => dừng, không tải/build trên máy 4 GiB.
+            docker compose -f docker-compose.embed.yml run --rm --no-deps embed \
+              python -m sict_crawler.service.embedding.embed_server verify
             docker compose -f docker-compose.embed.yml up -d embed
             bind="$(grep '^EMBED_BIND=' .env | cut -d= -f2- || true)"; bind="${bind:-127.0.0.1}"
             for i in $(seq 1 60); do curl -sf -m 5 "http://$bind:8090/healthz" | grep -q '"ok":true' && break; sleep 5; done
             curl -sf -m 5 "http://$bind:8090/healthz"
 
   deploy-alloy:
-    needs: [prepare, deploy-vm1, deploy-vm2]
-    if: always() && needs.prepare.result == 'success' && inputs.deploy_alloy
+    needs: prepare
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_alloy
     runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     environment: production
