@@ -1,22 +1,21 @@
-"""Nạp artifact (compute.py) → Postgres + Qdrant `*_v2` + S3 — bước 3 của D16, chạy trên CPU.
+"""Nạp artifact v3 (compute.py) → Postgres + Qdrant v3 + local store/S3 — bước 3 D16.
 
 Không embed lại chunk/ảnh (vector có sẵn trong .npy). Point id = uuid5 của artifact → chạy lại ghi
-đè, không nhân bản. Collection v1 (`sict_text`/`sict_image`) không bị đụng → rollback API = trỏ
-QDRANT_COLLECTION_TEXT/IMAGE về tên cũ. Bảng `documents` upsert theo url, giữ id cũ (point v1 vẫn
-trỏ đúng); cột v1 (content_hash, raw_s3_key) giữ nguyên.
+đè, không nhân bản. Chỉ nạp vào sict_text_v3/sict_image_v3/sict_ocr_v3 với jina-clip-v2
+1024 chiều và manifest khớp config. Bảng `documents` upsert theo url, giữ id ổn định.
 
 Thứ tự: PG documents (upsert theo url, giữ id cũ) → videos → media (ảnh + frame, đưa file lên store)
-→ occurrence → Qdrant text (chunk + caption: dense E5 + sparse BM25) → Qdrant image (ảnh + frame)
+→ occurrence → Qdrant text + OCR (dense Jina + sparse BM25) → Qdrant image (ảnh + frame)
 → kiểm tra số point = số dòng artifact.
 
 Usage:
-  python -m sict_crawler.pipeline.loader --artifacts _snapshot/2026-10-12/artifacts/v2-multilingual-e5-small
-  python -m sict_crawler.pipeline.loader --artifacts A --recreate        # xoá & tạo lại collection *_v2
+  python -m sict_crawler.pipeline.loader --artifacts _snapshot/2026-10-12/artifacts/v3-jina-clip-v2
+  python -m sict_crawler.pipeline.loader --artifacts A --recreate        # xoá & tạo lại collection v3
   python -m sict_crawler.pipeline.loader --artifacts A --skip-media-upload   # store đã có file media
   python -m sict_crawler.pipeline.loader --artifacts A --upload-media        # store S3: BẮT BUỘC có cờ mới upload
   python -m sict_crawler.pipeline.loader --artifacts A --media-only --upload-media   # chỉ upload media (cutover)
   python -m sict_crawler.pipeline.loader --artifacts A --tag-frames      # chỉ gắn bộ khung (media.frame_sets) cho DB nạp trước
-Collection đích = config/env (QDRANT_COLLECTION_TEXT/IMAGE), phải là schema v2.
+Collection đích = config/env (QDRANT_COLLECTION_TEXT/IMAGE/OCR), phải là schema v3.
 Callers: CLI.
 """
 from __future__ import annotations
@@ -44,12 +43,12 @@ def _jsonl(path: Path) -> list[dict]:
     return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x.strip()]
 
 
-def _npy(path: Path, n: int) -> np.ndarray:
+def _npy(path: Path, n: int, dim: int = 1024) -> np.ndarray:
     if n == 0:
-        return np.zeros((0, 0), dtype=np.float32)
-    arr = np.load(path)
-    if len(arr) != n:
-        raise SystemExit(f"{path.name}: {len(arr)} vector ≠ {n} dòng jsonl — artifact hỏng")
+        return np.zeros((0, dim), dtype=np.float32)
+    arr = np.load(path, allow_pickle=False)
+    if arr.shape != (n, dim) or not np.issubdtype(arr.dtype, np.number) or not np.isfinite(arr).all():
+        raise SystemExit(f"{path.name}: vectors phải là ma trận ({n}, {dim}) hữu hạn — artifact hỏng")
     return arr
 
 
@@ -75,25 +74,21 @@ class Loader:
     def check(self) -> None:
         """Vector artifact phải cùng model với encoder câu hỏi của API, nếu không điểm vô nghĩa."""
         emb = self.cfg.embedding
-        if emb.backend == "api":   # D22: một model cho cả chữ và ảnh; số chiều + tiền tố query phải khớp
-            want = {"backend": "api", "text_model": emb.model, "image_model": emb.model, "dim": emb.dim,
-                    "query_prefix": emb.query_prefix}
-        else:
-            want = {"text_model": emb.text_model, "image_model": emb.image_model}
-            if self.manifest.get("backend") == "api":
-                raise SystemExit("artifact nhúng bằng backend api nhưng config đang backend torch — không nạp")
+        if emb.backend != "api":
+            raise SystemExit("Loader chỉ hỗ trợ EMBED_BACKEND=api")
+        want = {"backend": "api", "text_model": emb.model, "image_model": emb.model,
+                "dim": 1024, "query_prefix": emb.query_prefix}
         for k, w in want.items():
             got = self.manifest.get(k)
             if got != w:
                 raise SystemExit(f"manifest {k}={got!r} ≠ config {w!r} — không nạp")
         q = self.cfg.qdrant
-        if emb.backend == "api" and (q.text_dim != emb.dim or q.image_dim != emb.dim):
+        if q.text_dim != 1024 or q.image_dim != 1024 or emb.dim != 1024:
             raise SystemExit(f"qdrant text_dim/image_dim ({q.text_dim}/{q.image_dim}) ≠ embedding.dim {emb.dim} "
                              "(đặt QDRANT_TEXT_DIM / QDRANT_IMAGE_DIM)")
         cols = (*vector_store.text_collections(), q.collection_image)
-        if not all(c.endswith(("_v2", "_v3")) for c in cols):
-            raise SystemExit(f"collection đích {'/'.join(cols)} không phải "
-                             "*_v2/*_v3 — không ghi đè index v1 (đặt QDRANT_COLLECTION_TEXT/IMAGE/OCR)")
+        if tuple(cols) != ("sict_text_v3", "sict_ocr_v3", "sict_image_v3"):
+            raise SystemExit("Loader chỉ ghi sict_text_v3/sict_ocr_v3/sict_image_v3")
 
     def _put(self, key: str, path: Path) -> None:
         if self.upload and self.st.put_file(key, path):
@@ -123,17 +118,7 @@ class Loader:
 
     async def run(self, recreate: bool = False) -> dict:
         self.check()
-        q = self.cfg.qdrant
-        client = vector_store.get_client()
-        if recreate:
-            for name in (*vector_store.text_collections(), q.collection_image):
-                if client.collection_exists(name):
-                    client.delete_collection(name)
-                    self.log(f"xoá collection {name}")
-        vector_store.ensure_collections()
-        vector_store.require_v2()
-        await db.init_db()
-
+        # Phải kiểm tra artifact TRƯỚC mọi tác động lên PG/Qdrant, đặc biệt --recreate.
         a = self.art
         docs = _jsonl(a / "documents.jsonl")
         chunks = _jsonl(a / "chunks.jsonl")
@@ -147,6 +132,16 @@ class Loader:
         v_caps_i = _npy(a / "captions_image.npy", len(caps_i))
         v_frames = _npy(a / "frames.npy", len(frames))
         v_caps_v = _npy(a / "captions_video.npy", len(caps_v))
+        q = self.cfg.qdrant
+        client = vector_store.get_client()
+        if recreate:
+            for name in (*vector_store.text_collections(), q.collection_image):
+                if client.collection_exists(name):
+                    client.delete_collection(name)
+                    self.log(f"xoá collection {name}")
+        vector_store.ensure_collections()
+        vector_store.require_v3()
+        await db.init_db()
         doc_by_key = {d["doc_id"]: d for d in docs}
 
         # ---- Postgres
@@ -295,10 +290,10 @@ async def tag_frames(art: Path) -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Nạp artifact compute → PG + Qdrant *_v2 + S3")
+    ap = argparse.ArgumentParser(description="Nạp artifact compute → PG + Qdrant *_v3 + store")
     ap.add_argument("--artifacts", required=True)
     ap.add_argument("--snapshot", default=None, help="mặc định lấy từ manifest.json")
-    ap.add_argument("--recreate", action="store_true", help="xoá & tạo lại collection *_v2 trước")
+    ap.add_argument("--recreate", action="store_true", help="xoá & tạo lại collection *_v3 trước")
     ap.add_argument("--skip-media-upload", action="store_true",
                     help="không đưa file media lên store (kể cả local)")
     ap.add_argument("--upload-media", action="store_true",

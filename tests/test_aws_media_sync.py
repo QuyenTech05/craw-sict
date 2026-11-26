@@ -28,8 +28,9 @@ def test_empty_aws_profile_selects_local_store(tmp_path):
     import json
     envfile = tmp_path / 'env'
     envfile.write_text('AWS_PROFILE=\n')
-    for compose, service in [('docker-compose.yml', 'api'), ('docker-compose.worker.yml', 'cron')]:
+    for compose, service, profiles in [('docker-compose.yml', 'api', []),
+                                       ('docker-compose.worker.yml', 'cron', ['--profile', 'batch'])]:
         result = subprocess.run(['docker', 'compose', '--env-file', str(envfile), '-f', str(ROOT / compose),
-                                 'config', '--format', 'json'], capture_output=True, text=True, check=True,
+                                 *profiles, 'config', '--format', 'json'], capture_output=True, text=True, check=True,
                                 env={**os.environ, 'AWS_PROFILE': ''})
         assert json.loads(result.stdout)['services'][service]['environment']['AWS_PROFILE'] == ''

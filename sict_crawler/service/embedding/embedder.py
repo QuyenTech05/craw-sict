@@ -1,9 +1,4 @@
-"""Embedding gateway. Hai họ backend, cùng giao diện hàm (chọn bằng embedding.backend / EMBED_BACKEND):
-
-- torch (index v2, mặc định tới khi cutover): E5 384-d cho chữ + CLIP B/32 512-d cho ảnh, hai không gian riêng.
-- api (index v3, D22): MỘT model đa phương thức (jina-clip-v2, 1024-d) qua endpoint HTTP — chữ và ảnh chung
-  không gian. Endpoint/key/model đặt bằng EMBED_API_BASE / EMBED_API_KEY / EMBED_MODEL, nên đổi nhà cung cấp
-  hoặc đổi sang bản tự host (ONNX int8 sau cùng giao diện) chỉ là đổi cấu hình.
+"""Embedding gateway v3 qua HTTP cho jina-clip-v2 ONNX int8 (1024 chiều).
 
 Callers: main.py, compute.py, indexer.py, api.py (query embed).
 Giao diện: embed_texts(list[str], kind="passage"|"query") → list[vec]; embed_query(str) → vec;
@@ -12,6 +7,7 @@ embed_image_bytes(list[bytes]) → (vecs, ok_idx); embed_image_base64; embed_tex
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import io
 import json
@@ -19,6 +15,7 @@ import math
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -26,109 +23,25 @@ from PIL import Image
 
 from sict_crawler.core.config import get_settings
 
-_text_model = None
-_clip_model = None
-_clip_preprocess = None
-_device: str | None = None
-
-
-def get_device() -> str:
-    """Resolve embedding.device một lần rồi cache (không dò lại mỗi batch).
-
-    auto → "cuda" nếu torch thấy GPU, ngược lại "cpu". Ép "cuda" mà máy không có
-    GPU (hoặc torch bản CPU) → rơi về "cpu" kèm cảnh báo, không crash.
-    """
-    global _device
-    if _device is None:
-        want = get_settings().embedding.device.strip().lower() or "auto"
-        has_cuda = False
-        if want != "cpu":
-            try:
-                import torch
-                has_cuda = bool(torch.cuda.is_available())
-            except Exception:
-                has_cuda = False
-        if want == "auto":
-            _device = "cuda" if has_cuda else "cpu"
-        elif want.startswith("cuda") and not has_cuda:
-            print(f"[embedder] device={want} nhưng không có GPU → dùng cpu")
-            _device = "cpu"
-        else:
-            _device = want
-        print(f"[embedder] device={_device}")
-    return _device
-
-
-def _get_text_model():
-    global _text_model
-    if _text_model is None:
-        from sentence_transformers import SentenceTransformer
-        cfg = get_settings()
-        _text_model = SentenceTransformer(cfg.embedding.text_model, device=get_device())
-    return _text_model
-
-
-def _get_clip():
-    global _clip_model, _clip_preprocess
-    if _clip_model is None:
-        from transformers import CLIPModel, CLIPProcessor
-        cfg = get_settings()
-        _clip_model = CLIPModel.from_pretrained(cfg.embedding.image_model).to(get_device()).eval()
-        _clip_preprocess = CLIPProcessor.from_pretrained(cfg.embedding.image_model)
-    return _clip_model, _clip_preprocess
-
-
-def _torch_embed_texts(texts: list[str], kind: str = "passage") -> list[list[float]]:
-    """E5 multilingual text embeddings (384-dim)."""
-    model = _get_text_model()
-    # e5 convention: prefix "query: " for queries, "passage: " for docs
-    prefixed = [f"{kind}: {t}" for t in texts]
-    vecs = model.encode(prefixed, batch_size=get_settings().embedding.batch_size,
-                        normalize_embeddings=True)
-    return [v.tolist() for v in vecs]
-
-
-def _torch_embed_image_bytes(images: list[bytes]) -> tuple[list[list[float]], list[int]]:
-    """CLIP embeddings from raw bytes. Skips undecodable images.
-    Returns (vectors, indices_into_input) — vectors[i] corresponds to images[indices[i]]."""
-    import torch
-    model, processor = _get_clip()
-    ok_imgs, ok_idx = [], []
-    for i, b in enumerate(images):
-        try:
-            img = Image.open(io.BytesIO(b))
-            img.verify()  # reject corrupt/svg/html masquerading as jpg
-            ok_imgs.append(Image.open(io.BytesIO(b)).convert("RGB"))
-            ok_idx.append(i)
-        except Exception:
-            continue
-    if not ok_imgs:
-        return [], []
-    inputs = processor(images=ok_imgs, return_tensors="pt").to(get_device())
-    with torch.no_grad():
-        out = model.get_image_features(**inputs)
-        feats = out.pooler_output if not torch.is_tensor(out) else out
-    feats = feats / feats.norm(dim=-1, keepdim=True)
-    return feats.cpu().tolist(), ok_idx
-
-
-def _torch_embed_text_clip(texts: list[str]) -> list[list[float]]:
-    """CLIP text encoder (512-dim) — for cross-modal query into image collection."""
-    import torch
-    model, processor = _get_clip()
-    inputs = processor(text=texts, return_tensors="pt", padding=True,
-                        truncation=True, max_length=77).to(get_device())
-    with torch.no_grad():
-        out = model.get_text_features(**inputs)
-        feats = out.pooler_output if not torch.is_tensor(out) else out
-    feats = feats / feats.norm(dim=-1, keepdim=True)
-    return feats.cpu().tolist()
-
-
 # ---------------------------------------------------------------- backend api (jina-clip-v2, index v3)
 
 class EmbedError(RuntimeError):
     """Gọi endpoint embedding thất bại sau khi thử lại. Lỗi cứng: thiếu vector là sai dữ liệu, không bỏ qua."""
+
+
+_query_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "embedding_query_deadline", default=None
+)
+
+
+@contextmanager
+def query_embedding_budget(seconds: float = 25.0):
+    """Giới hạn tổng thời gian nhúng của một truy vấn, độc lập retry của worker/bulk."""
+    token = _query_deadline.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _query_deadline.reset(token)
 
 
 _usage_lock = threading.Lock()
@@ -204,6 +117,9 @@ def _throttle(tokens: int) -> None:
     if not tpm:
         return
     while True:
+        deadline = _query_deadline.get()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise EmbedError("quá thời gian nhúng truy vấn")
         with _sent_lock:
             now = time.time()
             _sent[:] = [(t, n) for t, n in _sent if now - t < 60]
@@ -212,6 +128,8 @@ def _throttle(tokens: int) -> None:
                 _sent.append((now, tokens))
                 return
             wait = 60 - (now - _sent[0][0]) + 0.5
+        if deadline is not None and time.monotonic() + wait >= deadline:
+            raise EmbedError("hạn mức embedding vượt thời gian nhúng truy vấn")
         time.sleep(max(0.5, wait))
 
 
@@ -236,10 +154,19 @@ def _post(items: list[dict]) -> list[list[float]]:
     # hết timeout thì client gửi lại trong khi server vẫn tính lô cũ (chồng việc) → timeout giãn theo khối lượng
     timeout = max(e.timeout, IMAGE_TIMEOUT_S * sum("image" in it for it in items)
                   + TEXT_TIMEOUT_S_PER_KCHAR * sum(len(it.get("text", "")) for it in items) / 1000)
-    for attempt in range(e.api_retries):
+    deadline = _query_deadline.get()
+    attempts = 1 if deadline is not None else e.api_retries
+    for attempt in range(attempts):
         wait = 0.0
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EmbedError("quá thời gian nhúng truy vấn")
+            request_timeout = min(timeout, remaining)
+        else:
+            request_timeout = timeout
         try:
-            r = httpx.post(f"{e.api_base.rstrip('/')}/embeddings", json=body, headers=headers, timeout=timeout)
+            r = httpx.post(f"{e.api_base.rstrip('/')}/embeddings", json=body, headers=headers, timeout=request_timeout)
         except httpx.HTTPError as ex:
             last = f"{type(ex).__name__}: {ex}"
         else:
@@ -262,9 +189,9 @@ def _post(items: list[dict]) -> list[list[float]]:
                 wait = float(r.headers.get("retry-after", ""))
             except ValueError:
                 wait = 60.0 if r.status_code == 429 else 0.0   # giới hạn theo phút: chờ hết cửa sổ
-        if attempt < e.api_retries - 1:
+        if attempt < attempts - 1:
             time.sleep(min(max(wait, 2.0 ** attempt), 90))
-    raise EmbedError(f"embedding endpoint lỗi sau {e.api_retries} lần: {last}")
+    raise EmbedError(f"embedding endpoint lỗi sau {attempts} lần: {last}")
 
 
 def _hf_gradio_request(payload: dict, kind: str, expected: int) -> list[list[float]]:
@@ -412,10 +339,10 @@ def _api_embed_image_bytes(images: list[bytes], query_size: int = 0) -> tuple[li
 # ---------------------------------------------------------------- giao diện chung
 
 def embed_texts(texts: list[str], kind: str = "passage") -> list[list[float]]:
-    """Vector chữ. kind="passage" (nội dung index) hoặc "query" (câu hỏi). Backend api: tiền tố query do cấu hình."""
+    """Vector chữ. kind="passage" (nội dung index) hoặc "query" (câu hỏi)."""
     if not texts:
         return []
-    return _api_embed_texts(texts, kind) if backend() == "api" else _torch_embed_texts(texts, kind)
+    return _api_embed_texts(texts, kind)
 
 
 def embed_query(text: str) -> list[float]:
@@ -424,7 +351,7 @@ def embed_query(text: str) -> list[float]:
 
 def embed_image_bytes(images: list[bytes]) -> tuple[list[list[float]], list[int]]:
     """Vector ảnh từ bytes. Bỏ qua ảnh không giải mã được. Trả (vectors, indices_into_input)."""
-    return _api_embed_image_bytes(images) if backend() == "api" else _torch_embed_image_bytes(images)
+    return _api_embed_image_bytes(images)
 
 
 def embed_image_base64(b64_list: list[str]) -> list[list[float]]:
@@ -433,17 +360,15 @@ def embed_image_base64(b64_list: list[str]) -> list[list[float]]:
 
 
 def embed_query_image_base64(b64_list: list[str]) -> list[list[float]]:
-    """Ảnh người dùng gửi (truy vấn). Backend api + embedding.query_image_size: tháp ảnh cỡ nhỏ (nhanh hơn ~45 %
+    """Ảnh người dùng gửi (truy vấn). embedding.query_image_size: tháp ảnh cỡ nhỏ (nhanh hơn ~45 %
     trên 2 vCPU: 336 ~3,8 s, 392 ~5,3 s, 512 ~9,6 s); còn lại như ảnh corpus. Không dùng cho ảnh đưa vào index."""
     size = get_settings().embedding.query_image_size
-    if backend() != "api" or not size:
+    if not size:
         return embed_image_base64(b64_list)
     vecs, _ = _api_embed_image_bytes([base64.b64decode(b) for b in b64_list], query_size=size)
     return vecs
 
 
 def embed_text_clip(texts: list[str]) -> list[list[float]]:
-    """Chữ → không gian ảnh. Backend api: chung không gian nên chính là vector query; torch: CLIP text 512-d."""
-    if backend() == "api":
-        return _api_embed_texts(texts, "query")
-    return _torch_embed_text_clip(texts)
+    """Chữ → không gian ảnh chung của jina-clip-v2."""
+    return _api_embed_texts(texts, "query")

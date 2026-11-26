@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "functions": {
+    "api/ocr.mjs": {"maxDuration": 60},
+    "api/ocr-batch.mjs": {"maxDuration": 60},
+    "api/jobs.mjs": {"maxDuration": 15}
+  }
+}

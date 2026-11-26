@@ -242,7 +242,7 @@ def test_retrieve_none_route_skips_media_leg(monkeypatch=None):
     saved = (query_rewriter.rewrite, query_rewriter.hybrid_search_text, query_rewriter.rerank_text,
              embedder.embed_query, embedder.embed_text_clip, vector_store.search_images,
              cache.get, cache.put, vector_store.keyword_search, vector_store.has_sparse)
-    calls = {"clip": 0}
+    calls = {"image_search": 0}
     try:
         query_rewriter.rewrite = lambda q: {"rewritten": q, "terms": ["hoc", "phi"], "route_llm": None}
         hits = [{"url": "https://x/vn/a", "title": "A", "content": "học phí", "score": 0.9,
@@ -253,17 +253,17 @@ def test_retrieve_none_route_skips_media_leg(monkeypatch=None):
         query_rewriter.rerank_text = lambda h, q, top_n=5, **k: [
             dict(x, raw_score=x["score"]) for x in h]
         embedder.embed_query = lambda q: [0.0]
-        embedder.embed_text_clip = lambda t: calls.__setitem__("clip", calls["clip"] + 1) or [[0.0]]
-        vector_store.search_images = lambda *a, **k: []
+        embedder.embed_text_clip = lambda t: [[0.0]]
+        vector_store.search_images = lambda *a, **k: calls.__setitem__("image_search", calls["image_search"] + 1) or []
         vector_store.keyword_search = lambda *a, **k: []   # không chạm Qdrant thật
         vector_store.has_sparse = lambda *a, **k: True
         cache.get = lambda k: None
         cache.put = lambda *a, **k: None
         t, m, route = retriever.retrieve("Học phí ngành CNTT bao nhiêu?", 5)
-        assert route.media == "none" and m == [] and calls["clip"] == 0
+        assert route.media == "none" and m == [] and calls["image_search"] == 0
         assert all(s.kind == "text" for s in t)  # caption ảnh không lọt vào nguồn chữ
         t, m, route = retriever.retrieve("Cho xem ảnh học phí", 5)
-        assert route.media == "required" and calls["clip"] == 1
+        assert route.media == "required" and calls["image_search"] >= 1
         assert [s.media_id for s in m] == [7]   # caption cosine 0.95 ≥ ngưỡng, cùng bài đứng đầu
     finally:
         (query_rewriter.rewrite, query_rewriter.hybrid_search_text, query_rewriter.rerank_text,

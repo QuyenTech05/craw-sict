@@ -56,14 +56,12 @@ qdrant:
   port: 6333
   grpc_port: 6334
   prefer_grpc: true
-  # index spec v2 (loader.py / indexer.py). Rollback về v1: QDRANT_COLLECTION_TEXT=sict_text
-  # QDRANT_COLLECTION_IMAGE=sict_image (chỉ API; worker v2 từ chối ghi vào collection v1).
-  collection_text: "sict_text_v2"
-  collection_image: "sict_image_v2"
-  # caption + OCR ảnh/video; "" = chung collection_text (v1/v2). Index v3: QDRANT_COLLECTION_OCR=sict_ocr_v3
-  collection_ocr: ""
-  text_dim: 384
-  image_dim: 512
+  # Index v3 cố định: ba collection cùng không gian jina-clip-v2 1024-d.
+  collection_text: "sict_text_v3"
+  collection_image: "sict_image_v3"
+  collection_ocr: "sict_ocr_v3"
+  text_dim: 1024
+  image_dim: 1024
 
 redis:
   url: "redis://localhost:6379/0"
@@ -79,10 +77,10 @@ s3:
   prefix_media: "media/"
 
 embedding:
-  text_model: "intfloat/multilingual-e5-small"
-  image_model: "openai/clip-vit-base-patch32"
-  device: "auto"   # auto: có GPU (CUDA) thì dùng, không thì CPU. Ép tay: cpu | cuda | cuda:1. Env EMBED_DEVICE ghi đè
-  batch_size: 32
+  backend: "api"
+  api_base: "http://localhost:8090/v1"
+  model: "jina-clip-v2"
+  dim: 1024
 
 chunking:
   min_tokens: 200

@@ -32,6 +32,9 @@ auto_process.sh.bak
 # OS/IDE
 .DS_Store
 .vscode/
+vercel/node_modules/
+vercel/.vercel/
+vercel/.env.local
 _cutover/
 
 # artifact eval sinh lại được (scripts/eval_compare.py)

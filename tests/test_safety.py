@@ -34,7 +34,7 @@ def test_mass_delete_guard():
 def test_cache_key_stable_and_scoped():
     a = query_cache_key("tuyển sinh", 5)
     assert a == query_cache_key("tuyển sinh", 5)
-    assert a.startswith("q:v13:")  # v13: route ảnh đầu vào và yêu cầu tệp; v12: media theo bằng chứng; v11: nhánh cụm tên riêng; v10: graph khái niệm; v9: ngữ cảnh đủ đoạn + đoạn liền kề + khôi phục dấu; v8: phạm vi mục, năm nhãn bảng, tiêu đề; v7: bảng mang nhãn; v6: bài áp đảo + "mới nhất" (v5: không LLM viết lại; v4 D27)
+    assert a.startswith("q:v14:")  # v14: phân biệt cache đã có trạng thái embedding ảnh
     assert a != query_cache_key("tuyển sinh", 8)
     assert a != query_cache_key("tuyển sinh?", 5)
     assert a != query_cache_key("tuyển sinh", 5, "sections=['thong-bao']")
@@ -73,14 +73,15 @@ def test_llm_vlm_env_override(monkeypatch):
 
 
 def test_qdrant_collection_env_override(monkeypatch):
-    """Blue/green: mặc định v2; env trỏ về collection v1 để rollback API."""
+    """Chỉ chấp nhận các collection v3 với dimension cố định."""
     from sict_crawler.core.config import _build
+    import pytest
 
-    assert _build(_minimal_data()).qdrant.collection_text == "sict_text_v2"
+    assert _build(_minimal_data()).qdrant.collection_text == "sict_text_v3"
     monkeypatch.setenv("QDRANT_COLLECTION_TEXT", "sict_text")
     monkeypatch.setenv("QDRANT_COLLECTION_IMAGE", "sict_image")
-    s = _build(_minimal_data())
-    assert (s.qdrant.collection_text, s.qdrant.collection_image) == ("sict_text", "sict_image")
+    with pytest.raises(ValueError, match="index v3"):
+        _build(_minimal_data())
 
 
 class _NoRow:

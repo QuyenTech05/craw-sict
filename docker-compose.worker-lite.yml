@@ -8,7 +8,7 @@
 #     corpus không đổi → bỏ qua, không rebuild 12h/lần vô ích).
 #   - svc-ocr không có trong file này (chỉ dùng cho collection v1).
 #
-# Chạy: docker compose -f docker-compose.worker-lite.yml up -d
+# Chạy trên batch host riêng: docker compose -f docker-compose.worker-lite.yml --profile batch up -d
 # .env theo .env.worker.example nhưng: CRAWLER_BACKEND=httpx, CRON_MEM_LIMIT=512m,
 #   EMBED_API_BASE=https://api.jina.ai/v1 (Jina Cloud — máy worker không nhốt embed), EMBED_API_KEY=<khóa>.
 x-worker-v3-env: &worker_v3_env
@@ -21,16 +21,17 @@ x-worker-v3-env: &worker_v3_env
   EMBED_CACHE_PATH: ${EMBED_CACHE_PATH:-}
   QDRANT_PORT: ${QDRANT_PORT:-}
   QDRANT_GRPC_PORT: ${QDRANT_GRPC_PORT:-}
-  QDRANT_COLLECTION_TEXT: ${QDRANT_COLLECTION_TEXT:-}
-  QDRANT_COLLECTION_IMAGE: ${QDRANT_COLLECTION_IMAGE:-}
-  QDRANT_COLLECTION_OCR: ${QDRANT_COLLECTION_OCR:-}
-  QDRANT_TEXT_DIM: ${QDRANT_TEXT_DIM:-}
-  QDRANT_IMAGE_DIM: ${QDRANT_IMAGE_DIM:-}
-  CHUNK_STRUCTURED: ${CHUNK_STRUCTURED:-}
+  QDRANT_COLLECTION_TEXT: ${QDRANT_COLLECTION_TEXT:-sict_text_v3}
+  QDRANT_COLLECTION_IMAGE: ${QDRANT_COLLECTION_IMAGE:-sict_image_v3}
+  QDRANT_COLLECTION_OCR: ${QDRANT_COLLECTION_OCR:-sict_ocr_v3}
+  QDRANT_TEXT_DIM: ${QDRANT_TEXT_DIM:-1024}
+  QDRANT_IMAGE_DIM: ${QDRANT_IMAGE_DIM:-1024}
+  CHUNK_STRUCTURED: ${CHUNK_STRUCTURED:-1}
   HF_HOME: /cache/hf
 
 services:
   cron:
+    profiles: ["batch"]
     image: ${WORKER_IMAGE:-sict-worker:latest}
     env_file: [{path: .env, required: false}]
     environment:

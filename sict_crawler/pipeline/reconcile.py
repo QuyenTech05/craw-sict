@@ -47,7 +47,7 @@ def _scroll(collection: str):
 
 
 async def reconcile(dry_run: bool = False) -> dict:
-    vector_store.require_v2()
+    vector_store.require_v3()
     q = get_settings().qdrant
     client = vector_store.get_client()
     async with db.get_session() as s:
@@ -137,7 +137,7 @@ async def prune_frames(apply: bool = False, include_untagged: bool = False) -> d
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Đối soát PG ↔ Qdrant (*_v2)")
+    ap = argparse.ArgumentParser(description="Đối soát PG ↔ Qdrant (*_v3)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--prune-frames", action="store_true", help="dọn bộ khung video của collection đã bỏ")
     ap.add_argument("--include-untagged", action="store_true", help="--prune-frames: xoá cả khung chưa gắn bộ")

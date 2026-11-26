@@ -247,8 +247,9 @@ def main() -> None:
     args = ap.parse_args()
 
     async def run():
-        vector_store.require_v2()
-        await db.init_db()
+        vector_store.require_v3()
+        if args.cmd != "stats":
+            await db.init_db()
         async with db.get_session() as s:
             if args.cmd == "rebuild":
                 return await rebuild(s)

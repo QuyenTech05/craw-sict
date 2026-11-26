@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import contextvars
 import json
+import logging
+import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from functools import lru_cache
 
 from sict_crawler.core.config import get_settings
 from sict_crawler.core.text import fold
@@ -21,17 +26,23 @@ DOC_MEDIA_LIMIT = 32  # A: số ảnh / khung hình tối đa lấy từ các b�
 # Tầng GIAI ĐOẠN của truy vấn song song (2026-10-25): nhúng ảnh truy vấn, nhánh media chạy cùng nhánh chữ. Tầng dưới là
 # vector_store.parallel (nhánh) → _per_collection (collection): việc ở tầng này chỉ chờ tầng dưới, không kẹt khi đầy.
 _STAGE_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="retrieve-stage")
+_LOG = logging.getLogger(__name__)
 
 
 def index_tag() -> str:
-    """Collection đang phục vụ: đổi v2 ↔ v3 (cutover / rollback) thì không lấy lại kết quả cache của index kia."""
+    """Fingerprint ba collection v3 để không dùng lại cache khi đổi index."""
     q = get_settings().qdrant
     return f"{q.collection_text}|{q.collection_image}|{q.collection_ocr}"
 
 
 def query_cache_key(question: str, top_k: int, filters_key: str = "", index: str | None = None) -> str:
     index = index_tag() if index is None else index
-    return "q:v13:" + hashlib.sha256(   # v13: route ảnh đầu vào và yêu cầu tệp; v12: media theo bằng chứng (ảnh của bài chữ đứng đầu, video, sufficient); v11: nhánh cụm tên riêng; v10: graph khái niệm D33 (bỏ [graph], ảnh theo người); v9: đoạn đủ dài, đoạn liền kề câu liệt kê, khôi phục dấu; v8: phạm vi mục + năm nhãn bảng + tiêu đề; v7: bảng mang nhãn; v6: D30
+    # Eval paired chạy hai API riêng; namespace theo lần đo để tránh cache cũ làm lệch latency/quality.
+    # Khi không có env này, cache key production giữ nguyên từng byte.
+    namespace = os.environ.get("SICT_EVAL_CACHE_NAMESPACE", "")
+    if namespace:
+        index = f"{index}|eval:{namespace}"
+    return "q:v14:" + hashlib.sha256(   # v14: không tái sử dụng cache trước khi ghi trạng thái ảnh
         f"{question}\x00{top_k}\x00{filters_key}\x00{index}".encode()).hexdigest()
 
 
@@ -48,7 +59,9 @@ def _graph_filter(keys: list[str], field: str = "entities", all_of: bool = False
 def _media_candidates(img_query_vecs: list[list[float]], terms: list[str], limit: int,
                       f: F.QueryFilters, text: str = "",
                       image_vecs: list[list[float]] | None = None, wants_video: bool = False,
-                      caption_vec: list[float] | None = None) -> list[dict]:
+                      caption_vec: list[float] | None = None,
+                      max_calls: int | None = None,
+                      allowed_legs: tuple[str, ...] | None = None) -> list[dict]:
     """Ứng viên media cho router.gate, giữ ĐIỂM GỐC theo loại (không RRF):
     CLIP ảnh (clip, raw_score=cosine) + caption khớp từ khoá (caption_kw, không điểm: gate chỉ nhận khi gắn bài chữ).
     image_vecs: vector của ẢNH người dùng gửi (D21, không gian jina) → modality "i2i", ngưỡng riêng; legacy CLIP thì
@@ -59,10 +72,17 @@ def _media_candidates(img_query_vecs: list[list[float]], terms: list[str], limit
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
     qf = F.to_qdrant(f)
-    calls: list = []   # mỗi lượt Qdrant 1 hàm → vector_store.parallel; ghép theo đúng thứ tự cũ
+    calls: list = []   # mỗi lượt Qdrant 1 hàm → vector_store.parallel
     frames = Filter(must=[FieldCondition(key="kind", match=MatchValue(value="video_frame"))])
-    for modality, vecs, flt in (("clip", img_query_vecs, qf), ("i2i", image_vecs or [], qf),
-                                ("clip", img_query_vecs if wants_video else [], vector_store._and(qf, frames))):
+    searches = (("image", "clip", img_query_vecs, qf),
+                ("image", "i2i", image_vecs or [], qf),
+                ("video", "clip", img_query_vecs if wants_video else [], vector_store._and(qf, frames)))
+    if allowed_legs is not None:
+        # Ảnh người dùng gửi cần giữ chỗ i2i khi budget nhỏ.
+        searches = (searches[1], searches[0], searches[2])
+    for leg, modality, vecs, flt in searches:
+        if allowed_legs is not None and leg not in allowed_legs:
+            continue
         for v in vecs:
             calls.append(lambda v=v, modality=modality, flt=flt: [
                 {**h, "modality": modality, "raw_score": h.get("score")}
@@ -77,8 +97,9 @@ def _media_candidates(img_query_vecs: list[list[float]], terms: list[str], limit
         except Exception:
             hits = []
         return [{**h, "modality": "caption_kw", "raw_score": None} for h in hits if h.get("kind") == "media_caption"]
-    calls.append(captions)
-    if wants_video and caption_vec is not None:
+    if allowed_legs is None or "caption" in allowed_legs:
+        calls.append(captions)
+    if wants_video and caption_vec is not None and (allowed_legs is None or "video" in allowed_legs):
         vcap = vector_store._and(cap_only, Filter(must=[FieldCondition(key="media_kind", match=MatchValue(value="video"))]))
 
         def video_captions():
@@ -89,7 +110,153 @@ def _media_candidates(img_query_vecs: list[list[float]], terms: list[str], limit
                 hits = []
             return [{**h, "modality": "caption", "raw_score": h.get("score")} for h in hits]
         calls.append(video_captions)
+    if max_calls is not None:
+        calls = calls[:max(0, max_calls)]
     return [h for part in vector_store.parallel(calls) for h in part]
+
+
+@lru_cache(maxsize=4)
+def _alias_from_file(path: str, mtime: int, min_confidence: float):
+    from sict_crawler.service.retrieval.entity_index import AliasIndex, load_alias_index
+    index = load_alias_index(path)
+    return AliasIndex(index.entries, min_confidence=min_confidence)
+
+
+def _plan_context(question: str, has_image: bool, filters: dict | None):
+    """Best-effort feature context. Thiếu artifact giữ deterministic router, không fail request."""
+    from pathlib import Path
+    from sict_crawler.service.retrieval import query_understanding, planner
+    from sict_crawler.service.graph import graph as G
+
+    settings = get_settings().retrieval
+    alias_index = None
+    if settings.entity_index_enabled and settings.entity_alias_path:
+        try:
+            path = Path(settings.entity_alias_path)
+            alias_index = _alias_from_file(str(path.resolve()), path.stat().st_mtime_ns,
+                                           settings.entity_alias_min_confidence)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            _LOG.warning("retrieval_alias_index_unavailable")
+    understanding = query_understanding.understand(question, has_image=has_image,
+                                                   filters=filters, alias_index=alias_index)
+    # Shadow tính plan thật để quan sát, chỉ candidate mới dùng plan để truy vấn.
+    # Concept graph D33 có matcher độc lập với alias entity. Dùng cùng tín hiệu
+    # đang phục vụ legacy để planner không vô tình bỏ phiếu RRF của graph.
+    graph_concepts = G.match_question(question, understanding.rewritten_question)
+    plan = planner.make_plan(understanding, enabled=True, settings=settings,
+                             has_graph_concepts=bool(graph_concepts))
+    return understanding, plan
+
+
+def _planner_cache_suffix(plan) -> str:
+    """Fingerprint thay đổi khi mode, graph/alias/rerank/leg policy thay đổi."""
+    settings = get_settings().retrieval
+    config = (plan.mode, plan.text_legs, plan.media_legs, plan.rerank_profile,
+              plan.max_qdrant_calls, plan.text_candidate_limit, plan.media_candidate_limit,
+              settings.entity_index_enabled, settings.entity_alias_path,
+              settings.entity_alias_min_confidence, settings.media_coupled_optional,
+              settings.rerank_top_n, settings.rerank_timeout_ms)
+    return "|planner:v1:" + hashlib.sha256(repr(config).encode()).hexdigest()[:16]
+
+
+def retrieve_with_plan(question, plan, *, text_kwargs: dict,
+                       media_kwargs: dict | None = None):
+    """Chạy độc lập các group, fusion riêng và giữ rank provenance.
+
+    Caller tạo embeddings/filters trước khi gọi. Cắt số leg theo budget để tránh
+    số lượt Qdrant tăng không giới hạn khi câu hỏi sinh nhiều alias/phrase.
+    """
+    from sict_crawler.service.retrieval import query_rewriter
+    from sict_crawler.service.retrieval.fusion import RankedList, fuse_text_lists, fuse_media_lists
+    from sict_crawler.service.retrieval.reranker import rank_candidates
+
+    start = time.monotonic()
+    media_budget = min(4, max(1, plan.max_qdrant_calls // 3)) if media_kwargs and plan.media_legs else 0
+    text_budget = max(0, plan.max_qdrant_calls - media_budget)
+    tfut = _STAGE_POOL.submit(query_rewriter.hybrid_search_text,
+                              return_ranked_lists=True, max_legs=text_budget,
+                              allowed_legs=plan.text_legs, **text_kwargs) if text_budget else None
+    mfut = _STAGE_POOL.submit(_media_candidates, max_calls=media_budget,
+                              allowed_legs=plan.media_legs, **media_kwargs) if media_budget else None
+    text_lists = tfut.result() if tfut else []
+    text_candidates = fuse_text_lists(text_lists)
+    text_candidates = rank_candidates(question, text_candidates, profile=plan.rerank_profile,
+                                       top_n=min(len(text_candidates), plan.text_candidate_limit),
+                                       timeout_ms=get_settings().retrieval.rerank_timeout_ms)
+    try:
+        media_hits = mfut.result() if mfut else []
+    except Exception:
+        _LOG.exception("retrieval_media_group_failed")
+        media_hits = []
+    groups: dict[str, list[dict]] = {}
+    for hit in media_hits:
+        groups.setdefault(str(hit.get("modality") or "clip"), []).append(hit)
+    media_candidates = fuse_media_lists([RankedList(name, tuple(hits)) for name, hits in groups.items()])
+    media_candidates = media_candidates[:plan.media_candidate_limit]
+    trace = {"route": plan.mode,
+             "leg_counts": {"text": len(text_lists), "media": len(groups)},
+             "stage_ms": {"groups": round((time.monotonic() - start) * 1000, 2)},
+             "evidence": "pending", "media_gate": "pending"}
+    return text_candidates, media_candidates, trace
+
+
+def _linked_media_hits(question: str, text_hits: list[dict], kept: list[dict], entities=(),
+                       *, wants_video: bool = False) -> tuple[list[dict], int]:
+    """Đối chiếu provenance và chủ đề sau video-dedup, giữ media-only có bằng chứng."""
+    from sict_crawler.core.sparse import question_terms, tokens
+    from sict_crawler.service.retrieval.evidence_linking import link_evidence
+    from sict_crawler.service.retrieval.fusion import RankedList, _key, fuse_media_lists, fuse_text_lists
+    from sict_crawler.service.retrieval.router import is_video
+
+    text_group = fuse_text_lists([RankedList("text", tuple(text_hits))])
+    media_group = fuse_media_lists([RankedList("media", tuple(kept))])
+    links = link_evidence(question, text_group, media_group, tuple(entities))
+    verified = {link.media_id for link in links.links}
+    fused = {candidate.candidate_id: candidate.payload for candidate in media_group}
+    # Từ về hình thức yêu cầu media không chứng minh chủ đề. Một video có
+    # provenance thật vẫn có thể nói về chuyện hoàn toàn khác với câu hỏi.
+    topic = set(question_terms(question)) - {
+        "video", "clip", "anh", "hinh", "chup", "huong", "dan", "gioi", "thieu",
+    }
+    by_doc = {str(doc): [] for h in text_hits for doc in (
+        h.get("document_id") if isinstance(h.get("document_id"), list)
+        else [h.get("document_id")]) if doc is not None}
+    for hit in text_hits:
+        docs = hit.get("document_id")
+        for doc in (docs if isinstance(docs, list) else [docs]):
+            if doc is not None and str(doc) in by_doc:
+                by_doc[str(doc)].append(str(hit.get("title") or "") + " " + str(hit.get("content") or ""))
+    seen: set[str] = set()
+    filtered: list[dict] = []
+    for hit in kept:
+        key = _key(hit, "media")
+        if key in seen:
+            continue
+        if wants_video and not is_video(hit) and hit.get("modality") != "i2i":
+            continue
+        docs = hit.get("document_id")
+        descriptions = [str(hit.get(field) or "") for field in
+                        ("title", "caption", "ocr_text", "subtitle")]
+        for doc in (docs if isinstance(docs, list) else [docs]):
+            descriptions.extend(by_doc.get(str(doc), []))
+        if topic and hit.get("modality") != "i2i":
+            matched = topic.intersection(tokens(" ".join(descriptions)))
+            # Chỉ yêu cầu một từ nội dung với câu ngắn; câu dài phải có
+            # ít nhất hai tín hiệu, tránh nhận nhầm do một từ chung.
+            required = 2 if len(topic) >= 4 else 1
+            if len(matched) < required:
+                continue
+        if key in verified or hit.get("modality") == "i2i":
+            merged = dict(hit)
+            enriched = fused.get(key, {})
+            for field_name in ("caption", "ocr_text", "subtitle"):
+                if not merged.get(field_name) and enriched.get(field_name):
+                    merged[field_name] = enriched[field_name]
+            if key in verified:
+                merged["evidence_verified"] = True
+            filtered.append(merged)
+            seen.add(key)
+    return filtered, len(links.links)
 
 
 def _doc_media(vec: list[float] | None, docs: list, limit: int, qf=None) -> list[dict]:
@@ -126,6 +293,8 @@ def _query_image_vec(b64: str | None) -> list[float] | None:
         return None
     try:
         v = embedder.embed_query_image_base64([b64])
+    except embedder.EmbedError:
+        raise
     except Exception:
         return None
     return v[0] if v else None
@@ -282,18 +451,29 @@ def retrieve(question: str, top_k: int = 5,
 
     Đa phương thức (D21, embedding.backend=api, chữ+ảnh chung không gian): ảnh gửi lên vừa tìm ảnh giống
     (i2i), vừa tìm chunk/caption (i2t), và kéo chunk của BÀI chứa ảnh gần trùng (i2i-doc); chỉ có ảnh
-    (question rỗng) → ra cả ảnh lẫn chữ. Backend torch giữ hành vi cũ: ảnh chỉ thêm 1 vector vào nhánh CLIP.
+    (question rỗng) → ra cả ảnh lẫn chữ qua jina-clip-v2.
 
     Cache Redis 10p theo (question, top_k, filters, hash ảnh).
     """
     from sict_crawler.service.retrieval import query_rewriter, router
     rc = get_settings().router
-    unified = embedder.backend() == "api"
-    has_text = bool(question.strip()) or not unified   # unified: question rỗng = truy vấn chỉ có ảnh
+    settings = get_settings().retrieval
+    candidate = settings.planner_mode == "candidate"
+    understanding = plan = None
+    if settings.planner_mode in {"shadow", "candidate"}:
+        try:
+            understanding, plan = _plan_context(question, bool(query_image_b64), filters)
+        except (ValueError, TypeError):
+            _LOG.exception("retrieval_planner_fallback")
+            candidate = False
+    if plan is not None and settings.planner_mode == "shadow":
+        _LOG.info("retrieval_shadow mode=%s confidence=%.2f", plan.mode, understanding.confidence)
+    has_text = bool(question.strip())
     # metadata: lọc cứng chỉ từ `filters` caller truyền; câu hỏi chỉ cho ưu tiên mềm (filters.py)
     f = F.merge(F.from_request(filters), F.infer(question))
     qf = F.to_qdrant(f)
-    ck = query_cache_key(question, top_k, f.cache_key() + _image_tag(query_image_b64))
+    index = index_tag() + _planner_cache_suffix(plan) if candidate and plan is not None else None
+    ck = query_cache_key(question, top_k, f.cache_key() + _image_tag(query_image_b64), index=index)
     hit = cache.get(ck) if route_override is None else None
     if hit:
         try:
@@ -303,7 +483,8 @@ def retrieve(question: str, top_k: int = 5,
         except Exception:
             pass
     # ảnh truy vấn (CPU, ~4 s ở 336 px) nhúng trong lúc phần chữ chạy (luật viết tắt, graph, nhúng câu hỏi)
-    ifut = _STAGE_POOL.submit(_query_image_vec, query_image_b64) if unified and query_image_b64 else None
+    ifut = (_STAGE_POOL.submit(contextvars.copy_context().run, _query_image_vec, query_image_b64)
+            if query_image_b64 else None)
     if has_text:
         r = query_rewriter.rewrite(question, allow_llm=False) if route_override is not None else query_rewriter.rewrite(question)
         route = route_override or router.decide(question, r.get("route_llm"), has_image=bool(query_image_b64))
@@ -316,6 +497,11 @@ def retrieve(question: str, top_k: int = 5,
     ents = G.match_question(question, r["rewritten"]) if has_text else []
     ekeys = G.ekeys(ents)
     route.entities = [e.name for e in ents]
+    if candidate and plan is not None and route_override is None:
+        if plan.mode == "text_only":
+            route.media = "none"
+        elif plan.mode == "text_grounded" and route.media == "none" and settings.media_coupled_optional:
+            route.media = "optional"
     if query_image_b64 and route.media == "none" and not route.oos:
         route.media = "optional"  # người dùng gửi ảnh → luôn xét media tương tự
     if route.wants_file:
@@ -337,43 +523,54 @@ def retrieve(question: str, top_k: int = 5,
         alt = [(rvec, r["rewritten"])]
     terms = list(dict.fromkeys(query_rewriter._terms(q0) + r["terms"])) if has_text else []
     ivec = ifut.result() if ifut is not None else None
-    if query_image_b64 and ivec is None and not has_text:
-        return [], [], router.Route(media="none", source="image", inputs=["image"])   # ảnh hỏng, không có chữ
+    route.image_status = ('ok' if ivec is not None else 'embedding_failed') if query_image_b64 else 'none'
+    if query_image_b64 and ivec is None and not question.strip():
+        return [], [], router.Route(media="none", source="image", inputs=["image"], image_status='embedding_failed')
     extra = [("i2t", ivec)] if ivec is not None else []
     # nhánh media không cần kết quả chữ để TÌM (chỉ cần khi chặn bằng router.gate) → chạy song song với nhánh chữ
     mfut = None
     # số media tối đa theo ý định (router.media_cap): `none` = rc.none_max (mặc định 0 → không chạy nhánh media)
     n_media = router.media_cap(route, top_k, rc.optional_max, rc.none_max)
     img_query_vecs: list = []
-    if unified:
-        clip_min, caption_min = rc.t2i_min, rc.t2c_min
-    else:
-        clip_min, caption_min = rc.clip_min, rc.caption_min
+    clip_min, caption_min = rc.t2i_min, rc.t2c_min
     if n_media > 0:
-        if unified:
-            img_query_vecs = [rvec] if rvec is not None else []
-            image_vecs = [ivec] if ivec is not None else []
-        else:
-            img_query_vecs = [embedder.embed_text_clip([r["rewritten"]])[0]]
-            image_vecs = []
-            if (qvec := _query_image_vec(query_image_b64)) is not None:
-                img_query_vecs.append(qvec)
+        img_query_vecs = [rvec] if rvec is not None else []
+        image_vecs = [ivec] if ivec is not None else []
         # ý định `none` (none_max > 0): chỉ ảnh của bài chữ đứng đầu (_doc_media), không tìm toàn collection
-        if route.media != "none":
-            mfut = _STAGE_POOL.submit(_media_candidates, img_query_vecs, r["terms"], max(top_k, 10), f,
-                                      r["rewritten"], image_vecs, route.wants_video, rvec)
+        if route.media != "none" and (not candidate or plan.mode in {"media_first", "parallel_multimodal"}):
+            if not candidate:
+                mfut = _STAGE_POOL.submit(_media_candidates, img_query_vecs, r["terms"], max(top_k, 10), f,
+                                          r["rewritten"], image_vecs, route.wants_video, rvec)
+    # Planner path: hai nhóm chạy song song; text fusion giữ từng leg, media fusion độc lập.
+    media_planned = []
+    retrieval_trace = None
+    search_kwargs = dict(tvec=tvec, terms=terms,
+                         limit=(min(plan.text_candidate_limit, max(k * (3 if route.list_question else 2), 10))
+                                if candidate else max(k * (3 if route.list_question else 2), 10)),
+                         query_filter=qf, text=q0 or None,
+                         graph_filter=[_graph_filter(ekeys, all_of=True), _graph_filter(ekeys)],
+                         extra_vecs=extra, alt_queries=alt, scope_filter=F.scope_qdrant(f),
+                         phrases=(list(understanding.name_phrases) if candidate and understanding is not None
+                                  else query_rewriter.name_phrases(q0)) if has_text else None)
+    if candidate and plan is not None:
+        media_kwargs = None
+        if n_media > 0 and route.media != "none" and set(plan.media_legs) & {"image", "caption", "video"}:
+            media_kwargs = dict(img_query_vecs=img_query_vecs, terms=r["terms"],
+                                limit=min(plan.media_candidate_limit, max(top_k, 10)), f=f,
+                                text=r["rewritten"], image_vecs=image_vecs,
+                                wants_video=route.wants_video, caption_vec=rvec)
+        ranked_text, media_planned, retrieval_trace = retrieve_with_plan(
+            q0, plan, text_kwargs=search_kwargs, media_kwargs=media_kwargs)
+        t_hits = [cand.to_hit() for cand in ranked_text]
+    else:
+        t_hits = query_rewriter.hybrid_search_text(**search_kwargs)
     # cụm tên riêng (2026-11-05): "Phạm Văn Tùng" → 1 danh sách dense chỉ trong đoạn chứa nguyên cụm (xem name_phrases)
-    t_hits = query_rewriter.hybrid_search_text(tvec, terms, limit=max(k * (3 if route.list_question else 2), 10),
-                                               query_filter=qf, text=q0 or None,
-                                               graph_filter=[_graph_filter(ekeys, all_of=True),
-                                                             _graph_filter(ekeys)],
-                                               extra_vecs=extra, alt_queries=alt, scope_filter=F.scope_qdrant(f),
-                                               phrases=query_rewriter.name_phrases(q0) if has_text else None)
     if has_text:
-        # raw_score = cosine câu hỏi↔đoạn (ngưỡng caption của router). v2: giữ thứ tự RRF dense+BM25
-        # (xem rerank_text); v1: xếp lại theo cosine như cũ.
-        reranked = query_rewriter.rerank_text(t_hits, r["rewritten"], top_n=len(t_hits),
-                                              reorder=not vector_store.has_sparse(), qvec=tvec)
+        # Candidate planner đã rerank theo profile riêng; chỉ bổ sung raw_score cho gate,
+        # không được để rerank cosine legacy đảo thứ tự candidate.
+        reranked = query_rewriter.rerank_text(
+            t_hits, r["rewritten"], top_n=len(t_hits),
+            reorder=(not candidate and not vector_store.has_sparse()), qvec=tvec)
     else:   # chỉ ảnh: danh sách duy nhất là cosine ảnh↔chữ → lọc theo i2t_min, điểm gốc = cosine
         reranked = [{**h, "raw_score": h["score"]} for h in t_hits if h["score"] >= rc.i2t_min]
     boosted = F.apply_title_boost(F.apply_boost(reranked, f), q0) if has_text else F.apply_boost(reranked, f)
@@ -393,10 +590,19 @@ def retrieve(question: str, top_k: int = 5,
         cands = _doc_media(dvec, [h.get("document_id") for h in top_hits], DOC_MEDIA_LIMIT, qf)
         if mfut is not None:
             cands += mfut.result()
+        if media_planned:
+            cands += [c.to_hit() for c in media_planned]
         cands += [{**h, "modality": "caption" if has_text else "i2t"}
                   for h in boosted if h.get("kind") == "media_caption"]
         kept = router.gate(route, top_hits, cands, top_k, clip_min, caption_min, rc.optional_max,
                            rc.i2i_min, rc.i2t_min, rc.none_max)
+        if candidate and plan is not None and plan.mode in {"media_first", "parallel_multimodal"}:
+            kept, n_links = _linked_media_hits(question, text_hits[:k], kept,
+                                               understanding.entities if understanding else (),
+                                               wants_video=route.wants_video)
+            if retrieval_trace is not None:
+                retrieval_trace["evidence"] = n_links
+                retrieval_trace["media_gate"] = len(kept)
     msrcs = media_sources([_as_media(h) for h in kept])
 
     # U4: ảnh giống ảnh người dùng gửi nằm trong bài nào → lấy đoạn gần ảnh nhất của bài đó làm ngữ cảnh
@@ -411,7 +617,12 @@ def retrieve(question: str, top_k: int = 5,
     tsrcs = text_sources(text_hits[:k] + extra)
     route.inputs = [x for x, on in (("text", bool(question.strip())), ("image", bool(query_image_b64))) if on]
     route.outputs = [x for x, on in (("text", bool(tsrcs)), ("image", bool(msrcs))) if on]
-    if route_override is None:
+    if retrieval_trace is not None:
+        try:
+            _LOG.info("retrieval_plan_trace %s", json.dumps(retrieval_trace))
+        except (TypeError, ValueError):
+            pass
+    if route_override is None and route.image_status != 'embedding_failed':
         cache.put(ck, json.dumps({
             "text": [s.model_dump() for s in tsrcs],
             "media": [s.model_dump() for s in msrcs],

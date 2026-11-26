@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -19,14 +20,90 @@ from starlette.concurrency import run_in_threadpool
 
 from sict_crawler.model.orm import MediaAsset
 from sict_crawler.model.schemas import QueryIn
+from sict_crawler.api.mvp_ocr import add_query_ocr
 from sict_crawler.repository import cache, db, storage
 from sict_crawler.service.retrieval import citations
 
 app = FastAPI(title="SICT RAG API")
+from sict_crawler.api.mvp_jobs import router as mvp_jobs_router
+
+app.include_router(mvp_jobs_router)
 from sict_crawler.api import metrics as _metrics  # noqa: E402 — D13: GET /metrics (HTTP + pipeline) cho Alloy / Grafana Cloud
 
 _metrics.instrument(app)
 _GRAPH_REFRESH_SEC = 600
+
+
+def _run_query(q: QueryIn):
+    """Threadpool dùng ngân sách HTTP embedding riêng cho request, không ảnh hưởng bulk ingest."""
+    from sict_crawler.service.embedding.embedder import query_embedding_budget
+    from sict_crawler.service.retrieval import agent
+
+    with query_embedding_budget():
+        return agent.run(q.question, q.top_k, q.image, q.filters)
+
+
+async def _readiness_checks() -> dict[str, bool]:
+    """Probe ngắn, chỉ đọc; phản ánh đủ VM1 stores + VM2 embedding."""
+    import httpx
+    import redis
+    from sqlalchemy import text
+
+    from sict_crawler.core.config import get_settings
+
+    settings = get_settings()
+
+    async def postgres() -> None:
+        async with db.get_engine().connect() as conn:
+            await conn.execute(text("SELECT 1"))
+
+    async def redis_store() -> None:
+        def ping() -> None:
+            client = redis.Redis.from_url(settings.redis_url, socket_timeout=2, socket_connect_timeout=2)
+            try:
+                client.ping()
+            finally:
+                client.close()
+        await asyncio.to_thread(ping)
+
+    async def http_probe(url: str, expect_ok: bool = False) -> None:
+        async with httpx.AsyncClient(timeout=2) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            if expect_ok and resp.json().get("ok") is not True:
+                raise ValueError("embedding chưa nạp model")
+
+    qdrant_url = f"http://{settings.qdrant.host}:{settings.qdrant.port}/readyz"
+    embed_url = settings.embedding.api_base.rstrip("/").removesuffix("/v1") + "/healthz"
+    probes = {
+        "postgres": postgres(),
+        "redis": redis_store(),
+        "qdrant": http_probe(qdrant_url),
+        "embed": http_probe(embed_url, expect_ok=True),
+    }
+
+    async def checked(coro) -> bool:
+        try:
+            await asyncio.wait_for(coro, timeout=3)
+            return True
+        except Exception:
+            return False
+
+    outcomes = await asyncio.gather(*(checked(probe) for probe in probes.values()))
+    return dict(zip(probes, outcomes))
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.get("/readyz")
+async def readyz():
+    checks = await _readiness_checks()
+    ready = all(checks.values())
+    return Response(content=json.dumps({"ready": ready, "services": checks}),
+                    status_code=200 if ready else 503, media_type="application/json")
 
 
 async def _refresh_graph() -> None:
@@ -59,20 +136,25 @@ _MEDIA_TTL = 86400    # bytes ảnh theo media_id (≤1MB mới cache)
 _MEDIA_MAX = 1_000_000
 
 
-RESPONSE_EXCLUDE = {"content"}   # D27: nội dung đầy đủ chỉ dùng cho ngữ cảnh LLM, HTTP trả excerpt
+RESPONSE_EXCLUDE = {"content", "evidence_verified"}   # trường nội bộ chỉ dùng cho agent/context
 IMAGE_ONLY_QUESTION = "Người dùng gửi một ảnh, không kèm câu hỏi. Hãy cho biết thông tin liên quan đến ảnh này."
 
 
 @app.post("/query")
 async def query(q: QueryIn):
-    from sict_crawler.service.retrieval import agent as _agent
+    from sict_crawler.service.embedding.embedder import EmbedError
     # agent.run đồng bộ (Qdrant, embed, LLM): gọi thẳng trong handler async thì chặn event loop → mọi request
     # (cả /metrics của Alloy) xếp hàng tuần tự; tải 4 luồng 2026-10-21: p50 0,4 → 1,6 s, scrape /metrics 30 s, up=0
-    res = await run_in_threadpool(_agent.run, q.question, q.top_k, q.image, q.filters)
-    return {"answer": None, "context": res["context"],
+    try:
+        res = await add_query_ocr(q, await run_in_threadpool(_run_query, q))
+    except EmbedError as exc:
+        _metrics.EMBED_FAILURES.labels("query").inc()
+        raise HTTPException(status_code=503, detail="Dịch vụ embedding tạm thời không sẵn sàng") from exc
+    return {"answer": None, "context": res["context"], "image_status": res.get("image_status", "none"),
             "media_mode": res.get("media_mode"), "wants_file": res.get("wants_file"),
             "media_note": res.get("media_note"), "list_question": res.get("list_question"),
             "entities": res.get("entities"),
+            "ocr": res.get("ocr"),
             "graph_facts": res.get("graph_facts"),
             "inputs": res.get("inputs"), "outputs": res.get("outputs"),   # D21: đầu vào / đầu ra thực tế
             "citations": citations.index(res["text"] + res["media"]),     # D24: nguồn đánh số như trong context
@@ -87,18 +169,27 @@ async def chat(q: QueryIn):
     """SSE streaming qua agent loop: status (attempts) → sources event →
     streamed LLM answer (context echo fallback if no LLM key)."""
     from sict_crawler.core.config import get_settings
-    from sict_crawler.service.retrieval import agent as _agent
+    from sict_crawler.service.embedding.embedder import EmbedError
     from sict_crawler.service.retrieval import vlm
     if get_settings().llm.router_mode == "hybrid":
         return StreamingResponse(_hybrid_chat_stream(q), media_type="text/event-stream")
-    res = await run_in_threadpool(_agent.run, q.question, q.top_k, q.image, q.filters)   # xem /query
+    try:
+        res = await add_query_ocr(q, await run_in_threadpool(_run_query, q))
+    except EmbedError as exc:
+        _metrics.EMBED_FAILURES.labels("chat").inc()
+        raise HTTPException(status_code=503, detail="Dịch vụ embedding tạm thời không sẵn sàng") from exc
     tsrcs, msrcs, context = res["text"], res["media"], res["context"]
     if not res["sufficient"]:
         context = ("(Lưu ý: tài liệu tìm được chỉ liên quan một phần, "
                    "câu trả lời có thể chưa đầy đủ.)\n\n" + context)
 
     async def gen():
-        yield f"data: {json.dumps({'status': {'attempts': res['attempts'], 'sufficient': res['sufficient'], 'media_mode': res.get('media_mode'), 'wants_file': res.get('wants_file'), 'media_note': res.get('media_note'), 'list_question': res.get('list_question'), 'entities': res.get('entities'), 'inputs': res.get('inputs'), 'outputs': res.get('outputs')}})}\n\n"
+        if q.image and not q.question.strip() and res.get('image_status') == 'embedding_failed' and not (res.get('ocr') or {}).get('text'):
+            yield f"data: {json.dumps({'status': {'image_status': 'embedding_failed'}})}\n\n"
+            yield f"data: {json.dumps({'delta': 'Không xử lý được ảnh đính kèm (dịch vụ embedding lỗi). Vui lòng thử lại.'})}\n\n"
+            yield 'data: [DONE]\n\n'
+            return
+        yield f"data: {json.dumps({'status': {'attempts': res['attempts'], 'sufficient': res['sufficient'], 'media_mode': res.get('media_mode'), 'wants_file': res.get('wants_file'), 'media_note': res.get('media_note'), 'list_question': res.get('list_question'), 'entities': res.get('entities'), 'inputs': res.get('inputs'), 'outputs': res.get('outputs'), 'image_status': res.get('image_status', 'none'), 'ocr': res.get('ocr')}})}\n\n"
         yield f"data: {json.dumps({'text': [s.model_dump(exclude=RESPONSE_EXCLUDE) for s in tsrcs], 'media': [s.model_dump(exclude=RESPONSE_EXCLUDE) for s in msrcs]})}\n\n"
         if res.get("oos"):
             yield f"data: {json.dumps({'delta': 'Câu hỏi nằm ngoài phạm vi thông tin của SICT.'})}\n\n"
@@ -112,6 +203,7 @@ async def chat(q: QueryIn):
         streamed: list[str] = []
         q_out: queue.Queue = queue.Queue()
         SENTINEL = object()
+        generation = {}
 
         def worker():
             """vlm.stream_answer is a sync generator doing blocking HTTP."""
@@ -119,7 +211,7 @@ async def chat(q: QueryIn):
                 # T2 prompt cache (spec: docs/prompt_caching_multi_tier.md): hit → stream lại từ
                 # cache, không gọi LLM. Default tắt; mọi key chứa đủ model/context/index.
                 from sict_crawler.service.retrieval.prompt_cache import stream_answer_cached
-                gen = stream_answer_cached(q.question.strip() or IMAGE_ONLY_QUESTION, context, q.image)
+                gen = stream_answer_cached(q.question.strip() or IMAGE_ONLY_QUESTION, context, q.image, state=generation)
                 for chunk in gen:
                     q_out.put(chunk)
             finally:
@@ -145,6 +237,8 @@ async def chat(q: QueryIn):
         if final != said:
             yield f"data: {json.dumps({'delta': final[len(said):]} if final.startswith(said) else {'answer': final})}\n\n"
         yield f"data: {json.dumps({'citations': cites})}\n\n"
+        if generation.get('finish') != 'done':
+            yield f"data: {json.dumps({'status': {'generation': 'incomplete', 'error_code': generation.get('error_code', 'empty')}})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -163,14 +257,22 @@ async def _hybrid_chat_stream(q: QueryIn):
         try:
             # Import/compile LangGraph nằm trong worker, không chặn event loop ở request đầu.
             from sict_crawler.service.retrieval import graph
-            for event in graph.stream_chat(q.question, q.top_k, q.image, q.filters):
-                got_status = got_status or 'status' in event
-                got_sources = got_sources or 'text' in event
-                got_done = got_done or bool(event.get('done'))
-                events.put(event)
-        except Exception:
+            from sict_crawler.service.embedding.embedder import EmbedError, query_embedding_budget
+            with query_embedding_budget():
+                # Hook chạy trong worker sau retrieval, trước status và sinh câu trả lời.
+                # Khi không có ảnh, giữ tuyến streaming hybrid hiện tại.
+                postprocess = (lambda result: asyncio.run(add_query_ocr(q, result))) if q.image else None
+                for event in graph.stream_chat(q.question, q.top_k, q.image, q.filters, postprocess):
+                    got_status = got_status or 'status' in event
+                    got_sources = got_sources or 'text' in event
+                    got_done = got_done or bool(event.get('done'))
+                    events.put(event)
+        except Exception as exc:
             import logging
             logging.getLogger(__name__).exception('Luồng graph chat thất bại')
+            if isinstance(exc, EmbedError):
+                _metrics.EMBED_FAILURES.labels("chat_hybrid").inc()
+                events.put({'error': 'Dịch vụ embedding tạm thời không sẵn sàng'})
             if not got_done:
                 if not got_status:
                     events.put({'status': {'attempts': 0, 'sufficient': False}})

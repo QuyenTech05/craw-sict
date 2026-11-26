@@ -104,6 +104,27 @@ def test_graph_config_from_yaml():
     assert _build(data).graph.concept_df_max_ratio == 0.1
 
 
+def test_graph_stats_cli_never_initializes_schema(monkeypatch, capsys):
+    from unittest.mock import AsyncMock, MagicMock
+    from sict_crawler.repository import db, vector_store
+    from sict_crawler.service.graph import graphsync
+
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    init_db = AsyncMock()
+    monkeypatch.setattr(db, "init_db", init_db)
+    monkeypatch.setattr(db, "get_session", lambda: session)
+    monkeypatch.setattr(vector_store, "require_v3", lambda: None)
+    stats = AsyncMock(return_value={"links": 2})
+    monkeypatch.setattr(graphsync, "graph_stats", stats)
+    monkeypatch.setattr(sys, "argv", ["graphsync", "stats"])
+    graphsync.main()
+    init_db.assert_not_awaited()
+    stats.assert_awaited_once_with(session)
+    assert '"links": 2' in capsys.readouterr().out
+
+
 def test_gazetteer_query_match_folds_accents():
     g = G.Gazetteer([G.Entity(kind="concept", key="hoc phi", name="học phí", doc_count=5)])
     assert [e.key for e in g.match("Học phí năm 2025 bao nhiêu?")] == ["hoc phi"]

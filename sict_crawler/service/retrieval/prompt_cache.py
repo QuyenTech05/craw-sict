@@ -29,7 +29,7 @@ from sict_crawler.repository import cache
 
 log = logging.getLogger("sict.prompt_cache")
 
-PROMPT_CACHE_VERSION = "pc:v1"
+PROMPT_CACHE_VERSION = "pc:v2"  # Không dùng lại câu trả lời có thể bị cắt từ cache cũ.
 # Giữ đồng bộ với ROUTE_POLICY_VERSION trong hybrid_router.py (import vòng nên giữ hằng ở đây)
 _ROUTE_POLICY_VERSION = "intent-v5"
 
@@ -129,7 +129,7 @@ def put_answer(question: str, image_hash: str, context: str, index_fingerprint: 
         log.debug("prompt cache put failed: key=%s", key)
 
 
-def stream_answer_cached(question: str, context: str, image_b64: str | None = None):
+def stream_answer_cached(question: str, context: str, image_b64: str | None = None, *, state: dict | None = None):
     """Generator bọc vlm.stream_answer với T2 cache — cùng hợp đồng delta cho caller.
 
     Hit: yield câu trả lời cache chia khúc 80 ký tự (giống fallback echo, UI vẽ mượt).
@@ -138,21 +138,22 @@ def stream_answer_cached(question: str, context: str, image_b64: str | None = No
     """
     from sict_crawler.service.retrieval import retriever, vlm   # import tại chỗ tránh vòng
 
+    state = state if state is not None else {}
+    state.update(finish='error', error_code='empty')
     image_hash = _sha256(image_b64 or "")[:16]
     index_fp = retriever.index_tag()
     cached = get_answer(question, image_hash, context, index_fp)
     if cached is not None:
+        state.update(finish='done', error_code=None)
         log.debug("T2 prompt cache HIT: %s", question[:60])
         for offset in range(0, len(cached), 80):
             yield cached[offset:offset + 80]
         return
     pieces: list[str] = []
-    ok = False
     try:
-        for chunk in vlm.stream_answer(question, context, image_b64):
+        for chunk in vlm.stream_answer(question, context, image_b64, state=state):
             pieces.append(chunk)
             yield chunk
-        ok = True
     finally:
-        if ok:
+        if state.get('finish') == 'done':
             put_answer(question, image_hash, context, index_fp, "".join(pieces))

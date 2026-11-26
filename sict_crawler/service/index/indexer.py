@@ -1,4 +1,4 @@
-"""Ghi index spec v2 vào Postgres + Qdrant `*_v2` — 1 đường ghi cho cả bulk lẫn incremental.
+"""Ghi index spec v2 (quy tắc chunk/payload) vào Postgres + Qdrant v3.
 
   - loader.py (bulk): artifact của compute.py → các hàm `upsert_*` + `*_payload` ở đây.
   - index_page (incremental, main._process_page): 1 trang HTML → cùng quy tắc compute (page_doc,
@@ -79,7 +79,7 @@ def caption_rec(doc: dict, media_kind: str, caption_id: str, text: str,
 
 def caption_payload(cap: dict, document_id: int, media_url: str, media_key: str | None,
                     video_key: str | None = None, entities: list[str] | None = None) -> dict:
-    """Caption (sict_text_v2): url = ảnh/video (nguồn media), page_url = bài chứa nó."""
+    """Caption (sict_text_v3): url = ảnh/video (nguồn media), page_url = bài chứa nó."""
     return {"kind": "media_caption", "media_kind": cap["media_kind"], "entities": entities or [],
             "caption_id": cap["caption_id"], "media_key": media_key, "video_key": video_key,
             "document_id": document_id, "doc_key": cap["doc_id"], "url": media_url,
@@ -94,7 +94,7 @@ def caption_payload(cap: dict, document_id: int, media_url: str, media_key: str 
 def media_payload(kind: str, sha: str, s3_key: str, url: str, pages: list[tuple[int, dict]],
                   caption: str = "", urls: list[str] | None = None, timestamp: float | None = None,
                   video_key: str | None = None) -> dict:
-    """Point ảnh/frame (sict_image_v2). pages: [(document_id PG, doc dict)] — metadata dạng danh
+    """Point ảnh/frame (sict_image_v3). pages: [(document_id PG, doc dict)] — metadata dạng danh
     sách (lọc cứng khớp khi BẤT KỲ bài chứa nào khớp)."""
     docs = [d for _, d in pages]
     pubs = [d["published_at"] for d in docs if d.get("published_at")]
@@ -238,7 +238,7 @@ def write_text(items: list[tuple[str, str, dict]], batch: int | None = None) -> 
     from sict_crawler.service.embedding import embedder
     if not items:
         return 0
-    bs = batch or get_settings().embedding.batch_size
+    bs = batch or get_settings().embedding.api_batch
     pts = []
     for i in range(0, len(items), bs):
         part = items[i:i + bs]
@@ -475,7 +475,7 @@ async def index_page(session, st, url: str, html: str, depth: int = 0, frontier=
     lượt xem trong HTML không còn làm bài "đổi" mỗi lần tải. Caller không cần commit."""
     from sict_crawler.service.crawl import parser
     from sict_crawler.service.crawl.urls import link_depth
-    vector_store.require_v2()
+    vector_store.require_v3()
     status, doc, md, parsed = rules.page_doc(url, html)
     if parsed is None:
         parsed = parser.parse_html(url, html)

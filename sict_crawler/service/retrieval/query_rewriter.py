@@ -149,7 +149,9 @@ def hybrid_search_text(tvec: list[float] | None, terms: list[str], limit: int = 
                        text: str | None = None, graph_filter=None,
                        extra_vecs: list[tuple[str, list[float]]] | None = None,
                        alt_queries: list[tuple[list[float], str]] | None = None,
-                       scope_filter=None, phrases: list[str] | None = None) -> list[dict]:
+                       scope_filter=None, phrases: list[str] | None = None,
+                       return_ranked_lists: bool = False, max_legs: int | None = None,
+                       allowed_legs: set[str] | tuple[str, ...] | None = None):
     """Dense E5 + keyword legs fused by RRF.
 
     Keyword leg (vector_store.keyword_search): collection v2 → BM25 sparse trên token bỏ dấu của
@@ -190,48 +192,78 @@ def hybrid_search_text(tvec: list[float] | None, terms: list[str], limit: int = 
     # mỗi nhánh 1 lượt gọi, chạy song song (vector_store.parallel); thứ tự danh sách giữ nguyên như khi tuần tự
     # (dense câu gốc đứng đầu → hit trùng giữ bản có dense_score)
     legs = []
+    leg_names = []
+
+    allowed = set(allowed_legs) if allowed_legs is not None else None
+
+    def push(name, fn):
+        permitted = allowed is None or name in allowed
+        if allowed is not None:
+            if name.startswith("name_") and "name_phrase" in allowed:
+                permitted = True
+            elif name.endswith("_scope") and "scope" in allowed:
+                permitted = True
+        if permitted and (max_legs is None or len(legs) < max_legs):
+            legs.append(fn)
+            leg_names.append(name)
+
+    def add_name_legs():
+        if allowed is not None and "name_phrase" not in allowed and not {"name_dense", "name_bm25"} & allowed:
+            return
+        for ph in (phrases or []) if tvec is not None else []:
+            # phrase_filter cũng gọi Qdrant; bỏ preflight khi không còn chỗ cho leg.
+            if max_legs is not None and len(legs) >= max_legs:
+                break
+            try:
+                pf = vector_store.phrase_filter(ph)
+            except Exception:
+                pf = None
+            if pf is None:
+                continue
+            pf = vector_store._and(query_filter, pf)
+            push("name_dense", best_effort(lambda pf=pf: [{**h, "dense_score": h["score"], "via": "name"}
+                                                    for h in vector_store.search_text(tvec, limit=limit, query_filter=pf)]))
+            if text or terms:
+                push("name_bm25", best_effort(lambda pf=pf: [{**h, "via": "name"} for h in vector_store.keyword_search(
+                    text or " ".join(terms), terms, limit=limit, query_filter=pf)]))
+
     if tvec is not None:
-        legs.append(dense_of(tvec))
+        push("dense", dense_of(tvec))
     if text or terms:
-        legs.append(best_effort(lambda: vector_store.keyword_search(text or " ".join(terms), terms, limit=limit,
+        push("bm25", best_effort(lambda: vector_store.keyword_search(text or " ".join(terms), terms, limit=limit,
                                                                     query_filter=query_filter)))
     for via, v in extra_vecs or []:
-        legs.append(lambda via=via, v=v: [{**h, "via": via} for h in vector_store.search_text(
+        push(via, lambda via=via, v=v: [{**h, "via": via} for h in vector_store.search_text(
             v, limit=limit, filter_document_id=filter_document_id, query_filter=query_filter)])
+    # Candidate ưu tiên alias trước các nhánh phụ để tránh hết leg budget.
+    # Legacy giữ nguyên thứ tự đã dùng để hiệu chỉnh RRF.
+    if allowed is not None:
+        add_name_legs()
     # graph (D20): câu hỏi nêu người/sự kiện/CLB → thêm 1 danh sách dense chỉ trong chunk/caption
     # gắn thực thể đó, gộp RRF (không lọc cứng: tên nhận sai không làm mất kết quả thường)
     # graph_filter: 1 filter hoặc danh sách (VD [cả 2 thực thể (AND), bất kỳ (OR)]) → mỗi filter 1 danh sách
     for gf in (graph_filter if isinstance(graph_filter, list) else [graph_filter]):
         if gf is not None and tvec is not None:
-            legs.append(best_effort(lambda gf=gf: vector_store.search_text(
+            push("graph", best_effort(lambda gf=gf: vector_store.search_text(
                 tvec, limit=limit, query_filter=vector_store._and(query_filter, gf))))
     for avec, atext in alt_queries or []:
-        legs.append(dense_of(avec))
-        legs.append(best_effort(lambda atext=atext: vector_store.keyword_search(
+        push("dense_alt", dense_of(avec))
+        push("bm25_alt", best_effort(lambda atext=atext: vector_store.keyword_search(
             atext, _terms(atext), limit=limit, query_filter=query_filter)))
     if scope_filter is not None:
         sf = vector_store._and(query_filter, scope_filter)
         if tvec is not None:
-            legs.append(best_effort(lambda: vector_store.search_text(tvec, limit=limit, query_filter=sf)))
+            push("dense_scope", best_effort(lambda: vector_store.search_text(tvec, limit=limit, query_filter=sf)))
         if text or terms:
-            legs.append(best_effort(lambda: vector_store.keyword_search(text or " ".join(terms), terms, limit=limit,
+            push("bm25_scope", best_effort(lambda: vector_store.keyword_search(text or " ".join(terms), terms, limit=limit,
                                                                         query_filter=sf)))
-    # cụm tên riêng: như scope_filter, mỗi cụm 1 dense + 1 BM25 chỉ trong điểm chứa nguyên cụm (phrase_filter đếm
-    # trước, ~0,01 s; cụm quá phổ biến / không có → None → không thêm nhánh). Hit gắn via=name, giữ cosine (dense_score)
-    for ph in (phrases or []) if tvec is not None else []:
-        try:
-            pf = vector_store.phrase_filter(ph)
-        except Exception:
-            pf = None
-        if pf is None:
-            continue
-        pf = vector_store._and(query_filter, pf)
-        legs.append(best_effort(lambda pf=pf: [{**h, "dense_score": h["score"], "via": "name"}
-                                               for h in vector_store.search_text(tvec, limit=limit, query_filter=pf)]))
-        if text or terms:
-            legs.append(best_effort(lambda pf=pf: [{**h, "via": "name"} for h in vector_store.keyword_search(
-                text or " ".join(terms), terms, limit=limit, query_filter=pf)]))
-    lists = [x for x in vector_store.parallel(legs) if x]
+    if allowed is None:
+        add_name_legs()
+    results = vector_store.parallel(legs)
+    if return_ranked_lists:
+        from sict_crawler.service.retrieval.fusion import RankedList
+        return [RankedList(name, tuple(hits)) for name, hits in zip(leg_names, results) if hits]
+    lists = [x for x in results if x]
     if len(lists) <= 1:
         return lists[0] if lists else []
     return _rrf(*lists)
@@ -269,11 +301,7 @@ def rerank_text(hits: list[dict], question: str, top_n: int = 5, reorder: bool =
             return hits[:top_n]
     if scored:
         texts = [f"{h.get('title', '')}. {h.get('content') or h.get('caption') or ''}"[:1000] for h in scored]
-        if embedder.backend() == "api":   # D22: tiền tố query do embedder áp (kind="query"), không gắn chữ vào văn bản
-            qv, tvecs = qvec or embedder.embed_query(question), embedder.embed_texts(texts)
-        else:
-            vecs = embedder.embed_texts([f"query: {question}"] + [f"passage: {t}" for t in texts])
-            qv, tvecs = vecs[0], vecs[1:]
+        qv, tvecs = qvec or embedder.embed_query(question), embedder.embed_texts(texts)
         for h, tv in zip(scored, tvecs):
             h["raw_score"] = sum(a * b for a, b in zip(qv, tv))  # cosine in [-1,1]
             if reorder:

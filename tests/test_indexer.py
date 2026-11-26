@@ -1,5 +1,5 @@
-"""Index spec v2: sparse BM25 bỏ dấu, payload indexer, collection v2 + gắn/gỡ bài khỏi media dùng
-chung (AC-B5), guard v1/v2. Qdrant chạy local mode (":memory:") — không cần service.
+"""Index v3: sparse BM25 bỏ dấu, payload indexer, collection v3 + gắn/gỡ bài khỏi media dùng
+chung (AC-B5). Qdrant chạy local mode (":memory:") — không cần service.
 
 Run: pytest tests/test_indexer.py
 """
@@ -83,10 +83,11 @@ def test_router_gate_multi_doc_media():
 def mem_qdrant(monkeypatch):
     from qdrant_client import QdrantClient
     q = get_settings().qdrant
-    monkeypatch.setattr(q, "collection_text", "t_v2")
-    monkeypatch.setattr(q, "collection_image", "i_v2")
-    monkeypatch.setattr(q, "text_dim", 4)
-    monkeypatch.setattr(q, "image_dim", 4)
+    monkeypatch.setattr(q, "collection_text", "sict_text_v3")
+    monkeypatch.setattr(q, "collection_image", "sict_image_v3")
+    monkeypatch.setattr(q, "collection_ocr", "sict_ocr_v3")
+    monkeypatch.setattr(q, "text_dim", 1024)
+    monkeypatch.setattr(q, "image_dim", 1024)
     monkeypatch.setattr(vector_store, "_client", QdrantClient(":memory:"))
     vector_store._caps.clear()
     yield vector_store.get_client()
@@ -97,60 +98,66 @@ def _pid(n: int) -> str:
     return str(uuid.UUID(int=n))
 
 
-def test_v2_collection_sparse_search_and_detach(mem_qdrant):
+def _dense(axis: int) -> list[float]:
+    vec = [0.0] * 1024
+    vec[axis] = 1.0
+    return vec
+
+
+def test_v3_collection_sparse_search_and_detach(mem_qdrant):
     from qdrant_client.models import PointStruct
     vector_store.ensure_collections()
-    vector_store.require_v2()
+    vector_store.require_v3()
     assert vector_store.has_sparse()
-    pts = [vector_store.text_point(_pid(1), [1, 0, 0, 0], "Học phí ngành Công nghệ thông tin",
+    pts = [vector_store.text_point(_pid(1), _dense(0), "Học phí ngành Công nghệ thông tin",
                                    {"kind": "text", "document_id": 1, "url": "u1"}),
-           vector_store.text_point(_pid(2), [0, 1, 0, 0], "Lịch thi học kỳ 2",
+           vector_store.text_point(_pid(2), _dense(1), "Lịch thi học kỳ 2",
                                    {"kind": "text", "document_id": 2, "url": "u2"}),
-           vector_store.text_point(_pid(3), [0, 0, 1, 0], "Ảnh lễ tốt nghiệp",
+           vector_store.text_point(_pid(3), _dense(2), "Ảnh lễ tốt nghiệp",
                                    {"kind": "media_caption", "document_id": 1, "url": "img"})]
-    vector_store.upsert_points("t_v2", pts)
+    vector_store.upsert_points("sict_text_v3", pts)
     hits = vector_store.keyword_search("hoc phi cong nghe", ["hoc", "phi"], limit=5)
     assert hits and hits[0]["url"] == "u1"           # không dấu khớp chữ có dấu, có xếp hạng
     img = indexer.media_payload("image", "s" * 64, "k", "img", [(1, _doc(1)), (2, _doc(2))])
     only1 = indexer.media_payload("image", "t" * 64, "k2", "img2", [(1, _doc(1))])
-    vector_store.upsert_points("i_v2", [PointStruct(id=_pid(10), vector=[1, 0, 0, 0], payload=img),
-                                        PointStruct(id=_pid(11), vector=[0, 1, 0, 0], payload=only1)])
+    vector_store.upsert_points("sict_image_v3", [PointStruct(id=_pid(10), vector=_dense(0), payload=img),
+                                                PointStruct(id=_pid(11), vector=_dense(1), payload=only1)])
     vector_store.delete_by_document(1)
-    left = {p.id: p.payload for p in mem_qdrant.scroll("i_v2", limit=10)[0]}
+    left = {p.id: p.payload for p in mem_qdrant.scroll("sict_image_v3", limit=10)[0]}
     assert left == {_pid(10): {**img, "document_id": [2]}}   # ảnh dùng chung còn, ảnh riêng xoá (AC-B5)
-    assert mem_qdrant.count("t_v2").count == 1               # chunk + caption của bài 1 đã xoá
+    assert mem_qdrant.count("sict_text_v3").count == 1
     assert vector_store.attach_document([_pid(10), _pid(11)], 5, "u5") == [_pid(10)]
-    p = mem_qdrant.retrieve("i_v2", [_pid(10)])[0].payload
+    p = mem_qdrant.retrieve("sict_image_v3", [_pid(10)])[0].payload
     assert p["document_id"] == [2, 5] and "u5" in p["page_urls"]
 
 
 def test_v3_captions_in_own_ocr_collection(mem_qdrant, monkeypatch):
     """v3: caption (tiêu đề + mục + OCR) nằm ở collection_ocr riêng; tìm kiếm / xoá / ghi bao cả hai."""
-    monkeypatch.setattr(get_settings().qdrant, "collection_ocr", "o_v2")
+    monkeypatch.setattr(get_settings().qdrant, "collection_ocr", "sict_ocr_v3")
     vector_store.ensure_collections()
-    assert vector_store.text_collections() == ["t_v2", "o_v2"] and mem_qdrant.collection_exists("o_v2")
-    assert vector_store.has_sparse("o_v2")
+    assert vector_store.text_collections() == ["sict_text_v3", "sict_ocr_v3"] and mem_qdrant.collection_exists("sict_ocr_v3")
+    assert vector_store.has_sparse("sict_ocr_v3")
     monkeypatch.setattr("sict_crawler.service.embedding.embedder.embed_texts",
-                        lambda ts, kind="passage": [[1, 0, 0, 0] if "phí" in t else [0, 1, 0, 0] for t in ts])
+                        lambda ts, kind="passage": [_dense(0) if "phí" in t else _dense(1) for t in ts])
     indexer.write_text([(_pid(1), "Học phí ngành CNTT", {"kind": "text", "document_id": 1, "url": "u1"}),
                         (_pid(2), "Ảnh học phí | chữ OCR", {"kind": "media_caption", "document_id": 1, "url": "img"}),
                         (_pid(3), "Lịch thi", {"kind": "text", "document_id": 2, "url": "u2"})])
-    assert mem_qdrant.count("t_v2").count == 2 and mem_qdrant.count("o_v2").count == 1
-    dense = vector_store.search_text([1, 0, 0, 0], limit=1)               # mỗi collection 1 → chunk + caption
+    assert mem_qdrant.count("sict_text_v3").count == 2 and mem_qdrant.count("sict_ocr_v3").count == 1
+    dense = vector_store.search_text(_dense(0), limit=1)
     assert sorted(h["kind"] for h in dense) == ["media_caption", "text"]
     assert [h["url"] for h in vector_store.keyword_search("hoc phi", ["hoc"], limit=5,
-                                                          collection="o_v2")] == ["img"]
+                                                          collection="sict_ocr_v3")] == ["img"]
     assert {h["url"] for h in vector_store.keyword_search("hoc phi", ["hoc"], limit=5)} == {"u1", "img"}
     vector_store.delete_by_document(1)
-    assert mem_qdrant.count("t_v2").count == 1 and mem_qdrant.count("o_v2").count == 0
+    assert mem_qdrant.count("sict_text_v3").count == 1 and mem_qdrant.count("sict_ocr_v3").count == 0
 
 
-def test_v1_collection_refused_for_v2_writes(mem_qdrant):
+def test_v3_refuses_collection_without_sparse_index(mem_qdrant):
     from qdrant_client.models import Distance, VectorParams
-    mem_qdrant.create_collection("t_v2", vectors_config=VectorParams(size=4, distance=Distance.COSINE))
+    mem_qdrant.create_collection("sict_text_v3", vectors_config=VectorParams(size=1024, distance=Distance.COSINE))
     assert not vector_store.has_sparse()
-    with pytest.raises(RuntimeError, match="schema v2"):
-        vector_store.require_v2()
+    with pytest.raises(RuntimeError, match="schema v3"):
+        vector_store.require_v3()
 
 
 def test_doc_hash():
@@ -192,12 +199,12 @@ def _reconcile_setup(mem_qdrant, monkeypatch, pg_rows):
     from sict_crawler.pipeline import reconcile
     from sict_crawler.repository import db
     vector_store.ensure_collections()
-    vector_store.upsert_points("t_v2", [
-        vector_store.text_point(_pid(i), [1, 0, 0, 0], f"chunk {i}", {"kind": "text", "document_id": d})
+    vector_store.upsert_points("sict_text_v3", [
+        vector_store.text_point(_pid(i), _dense(0), f"chunk {i}", {"kind": "text", "document_id": d})
         for i, d in enumerate([1, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3])])
-    vector_store.upsert_points("i_v2", [
-        PointStruct(id=_pid(100), vector=[1, 0, 0, 0], payload={"document_id": [1, 2]}),
-        PointStruct(id=_pid(101), vector=[0, 1, 0, 0], payload={"document_id": [2]})])
+    vector_store.upsert_points("sict_image_v3", [
+        PointStruct(id=_pid(100), vector=_dense(0), payload={"document_id": [1, 2]}),
+        PointStruct(id=_pid(101), vector=_dense(1), payload={"document_id": [2]})])
     log: list = []
     monkeypatch.setattr(db, "get_session", lambda: _FakeSession(pg_rows, log))
     return asyncio, reconcile, log
@@ -210,8 +217,8 @@ def test_reconcile_orphans(mem_qdrant, monkeypatch):
     st = asyncio.run(reconcile.reconcile())
     assert st["orphan_text"] == 1 and st["image_detach"] == 1 and st["image_orphan"] == 1
     assert st["docs_missing_points"] == 1 and len(log) == 1      # bài 4 → hash_v2 = NULL
-    assert mem_qdrant.count("t_v2").count == 11
-    left = {p.id: p.payload["document_id"] for p in mem_qdrant.scroll("i_v2")[0]}
+    assert mem_qdrant.count("sict_text_v3").count == 11
+    left = {p.id: p.payload["document_id"] for p in mem_qdrant.scroll("sict_image_v3")[0]}
     assert left == {_pid(100): [1]}
 
 
@@ -219,7 +226,7 @@ def test_reconcile_guard_aborts_on_empty_pg(mem_qdrant, monkeypatch):
     asyncio, reconcile, log = _reconcile_setup(mem_qdrant, monkeypatch, [])
     with pytest.raises(reconcile.ReconcileAbort):
         asyncio.run(reconcile.reconcile())
-    assert mem_qdrant.count("t_v2").count == 12                   # không xoá gì
+    assert mem_qdrant.count("sict_text_v3").count == 12
 
 
 class _Frame:

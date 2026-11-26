@@ -51,12 +51,11 @@ def _vec(key: str, dim: int) -> list[float]:
 
 
 def _fakes():
-    saved = (embedder.embed_texts, embedder.embed_image_bytes, embedder.get_device,
+    saved = (embedder.embed_texts, embedder.embed_image_bytes,
              ocr.ocr_text, video.extract_keyframes, video.fetch_video_info)
     embedder.embed_texts = lambda texts: [_vec(t, 8) for t in texts]
     embedder.embed_image_bytes = lambda imgs: ([_vec(str(len(b)) + str(b[:16]), 4) for b in imgs],
                                                list(range(len(imgs))))
-    embedder.get_device = lambda: "cpu"
     ocr.ocr_text = lambda b, max_len=300: "HOI CHO TRIEN LAM HANOI MIP FAIR 2026"
     video.extract_keyframes = lambda url, max_frames=None: [(b"frame-a" * 50, 0.0),
                                                             (b"frame-b" * 50, 5.0)]
@@ -66,7 +65,7 @@ def _fakes():
 
 
 def _restore(saved):
-    (embedder.embed_texts, embedder.embed_image_bytes, embedder.get_device,
+    (embedder.embed_texts, embedder.embed_image_bytes,
      ocr.ocr_text, video.extract_keyframes, video.fetch_video_info) = saved
 
 

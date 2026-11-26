@@ -1,21 +1,21 @@
-"""Compute nặng từ snapshot → artifact (chạy trên máy GPU; CPU vẫn chạy được, chỉ chậm hơn).
+"""Compute từ snapshot → artifact v3, nhúng qua HTTP embedding gateway.
 
-snapshot (snapshot.py) → parse (index spec v2, indexing.py) → chunk → embed E5 → ảnh CLIP + OCR
-→ caption E5 → video keyframe + phụ đề → artifact. Artifact KHÔNG phụ thuộc kho vector: load vào
-Qdrant (collection `*_v2`, Giai đoạn 3) không phải embed lại. Id cố định (uuid5) = point id.
+snapshot (snapshot.py) → parse (index spec v2, indexing.py) → chunk → embed Jina CLIP v2
+→ ảnh + OCR → caption → video keyframe + phụ đề → artifact. Artifact độc lập kho vector:
+load vào Qdrant v3 không cần embed lại. Id cố định (uuid5) = point id.
 
 Stages (chạy riêng được, stage đã có output thì bỏ qua trừ khi --force):
   docs    pages.jsonl + files.jsonl → documents.jsonl + chunks.jsonl (lọc listing, trang lỗi,
           trang fallback, tài liệu trùng nội dung, chunk boilerplate xuyên > N bài)
-  text    chunks.jsonl → chunks.npy (E5 passage)
-  images  ảnh không phải trang trí (xuất hiện ≤ N bài) → images.jsonl/.npy (CLIP) + OCR
-          → captions_image.jsonl/.npy (E5, mỗi lần xuất hiện 1 caption riêng: AC-B4)
-  videos  mỗi video 1 lần theo YouTube id → frames.jsonl/.npy (CLIP) + captions_video.jsonl/.npy
-Output: <out>/manifest.json ghi model, dim, device, số lượng, thời gian từng stage.
+  text    chunks.jsonl → chunks.npy (jina-clip-v2 passage)
+  images  ảnh không phải trang trí (xuất hiện ≤ N bài) → images.jsonl/.npy + OCR
+          → captions_image.jsonl/.npy (mỗi lần xuất hiện 1 caption riêng: AC-B4)
+  videos  mỗi video 1 lần theo YouTube id → frames.jsonl/.npy + captions_video.jsonl/.npy
+Output: <out>/manifest.json ghi model, dim, số lượng, thời gian từng stage.
 
-Usage (máy GPU: image worker bản GPU, EMBED_DEVICE=auto):
+Usage (cần EMBED_API_BASE trỏ tới embedding server):
   python -m sict_crawler.pipeline.compute --snapshot _snapshot/2026-10-12
-  python -m sict_crawler.pipeline.compute --snapshot S --stages docs,text --text-model intfloat/multilingual-e5-base
+  python -m sict_crawler.pipeline.compute --snapshot S --stages docs,text
 Callers: CLI.
 """
 from __future__ import annotations
@@ -94,21 +94,17 @@ class Compute:
         emb = self.cfg.embedding
         self.manifest.update({
             "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "text_model": emb.model if emb.backend == "api" else emb.text_model,
-            "image_model": emb.model if emb.backend == "api" else emb.image_model,
-            "device": "api" if emb.backend == "api" else (embedder._device or emb.device),
+            "text_model": emb.model,
+            "image_model": emb.model,
+            "device": "api",
             "boilerplate_docs": self.boilerplate_docs, "semantic_chunking": self.semantic,
             "structured_chunks": bool(self.cfg.chunking.structured)})
-        if emb.backend == "api":   # D22: loader so khớp với encoder câu hỏi (cùng model, số chiều, tiền tố query)
-            self.manifest.update({"backend": "api", "dim": emb.dim, "query_prefix": emb.query_prefix})
+        self.manifest.update({"backend": "api", "dim": emb.dim, "query_prefix": emb.query_prefix})
         (self.out / "manifest.json").write_text(
             json.dumps(self.manifest, ensure_ascii=False, indent=2))
 
     def _batch(self) -> int:
-        from sict_crawler.service.embedding import embedder
-        if self.cfg.embedding.backend == "api":   # đủ lớn để các luồng gọi song song đều có việc
-            return self.cfg.embedding.api_batch * max(1, self.cfg.embedding.api_workers)
-        return 128 if embedder.get_device().startswith("cuda") else self.cfg.embedding.batch_size
+        return self.cfg.embedding.api_batch * max(1, self.cfg.embedding.api_workers)
 
     # ---------------- docs ----------------
     def stage_docs(self) -> dict:
@@ -354,9 +350,7 @@ class Compute:
                 "videos": "frames.npy"}
 
     def run(self, stages: list[str], force: bool = False) -> dict:
-        from sict_crawler.service.embedding import embedder
-        self.log(f"backend={self.cfg.embedding.backend} "
-                 f"device={'api' if self.cfg.embedding.backend == 'api' else embedder.get_device()} stages={stages}")
+        self.log(f"backend=api stages={stages}")
         for st in stages:
             if not force and (self.out / self._OUTPUTS[st]).exists() and st in self.manifest["stages"]:
                 self.log(f"skip {st} (đã có output, dùng --force để chạy lại)")
@@ -376,7 +370,6 @@ def main() -> None:
     ap.add_argument("--snapshot", required=True)
     ap.add_argument("--out", default=None, help="mặc định <snapshot>/artifacts/<spec>-<model>")
     ap.add_argument("--stages", default=",".join(STAGES))
-    ap.add_argument("--text-model", default=None, help="ghi đè embedding.text_model (đánh giá model)")
     ap.add_argument("--boilerplate-docs", type=int, default=20)
     ap.add_argument("--no-semantic", action="store_true", help="chunk cửa sổ thay vì semantic")
     ap.add_argument("--include-fallback", action="store_true")
@@ -384,11 +377,9 @@ def main() -> None:
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
     cfg = get_settings()
-    if args.text_model:
-        cfg.embedding.text_model = args.text_model
     snap = Path(args.snapshot)
     out = Path(args.out) if args.out else (
-        snap / "artifacts" / f"{ix.SPEC_VERSION}-{cfg.embedding.text_model.rsplit('/', 1)[-1]}")
+        snap / "artifacts" / f"{ix.SPEC_VERSION}-{cfg.embedding.model.rsplit('/', 1)[-1]}")
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
     bad = [s for s in stages if s not in STAGES]
     if bad:

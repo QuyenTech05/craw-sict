@@ -51,13 +51,18 @@ class QdrantConfig:
     prefer_grpc: bool = True
     timeout: int = 30  # giây; worker batch ghi đặt cao hơn qua QDRANT_TIMEOUT
     api_key: str = ""  # QDRANT_API_KEY (D12), không ghi vào yaml; rỗng = Qdrant không bật khoá (dev)
-    collection_text: str = "sict_text_v2"
-    collection_image: str = "sict_image_v2"
-    # caption ảnh/video (tiêu đề + mục + chữ OCR + phụ đề), cùng không gian vector với chữ. Rỗng = chung
-    # collection_text như v1/v2; index v3 tách riêng (sict_ocr_v3) — vector_store.ocr_collection()
-    collection_ocr: str = ""
-    text_dim: int = 384
-    image_dim: int = 512
+    collection_text: str = "sict_text_v3"
+    collection_image: str = "sict_image_v3"
+    collection_ocr: str = "sict_ocr_v3"
+    text_dim: int = 1024
+    image_dim: int = 1024
+
+    def __post_init__(self):
+        expected = {"collection_text": "sict_text_v3", "collection_image": "sict_image_v3",
+                    "collection_ocr": "sict_ocr_v3", "text_dim": 1024, "image_dim": 1024}
+        for name, value in expected.items():
+            if getattr(self, name) != value:
+                raise ValueError(f"qdrant.{name} phải là {value!r} (index v3 duy nhất)")
 
 
 @dataclass
@@ -81,17 +86,11 @@ class S3Config:
 
 @dataclass
 class EmbeddingConfig:
-    text_model: str = "intfloat/multilingual-e5-small"
-    image_model: str = "openai/clip-vit-base-patch32"
-    device: str = "auto"  # auto | cpu | cuda[:N] — auto: có GPU thì dùng, không thì CPU
-    batch_size: int = 32
-    # D22: backend=api → một model đa phương thức (chữ+ảnh chung không gian) qua endpoint HTTP.
-    # backend=torch giữ E5 + CLIP cho index v2 tới khi cutover.
-    backend: str = "torch"          # torch | api
-    api_base: str = ""              # EMBED_API_BASE (Jina cloud: https://api.jina.ai/v1; tự host: URL service)
+    backend: str = "api"
+    api_base: str = "http://localhost:8090/v1"  # đặt EMBED_API_BASE khi deploy API/worker
     api_key: str = ""               # EMBED_API_KEY, không ghi vào yaml
     model: str = "jina-clip-v2"     # EMBED_MODEL
-    dim: int = 1024                 # EMBED_DIM; Matryoshka: có thể cắt xuống (64–1024)
+    dim: int = 1024                 # index v3 chỉ nhận 1024 chiều
     query_prefix: str = "Represent the query for retrieving evidence documents: "
     text_provider: str = "jina"  # jina | hf-space
     image_provider: str = "jina"  # jina | hf-space
@@ -110,9 +109,6 @@ class EmbeddingConfig:
     query_image_size: int = 0
 
     def __post_init__(self):
-        # EMBED_DEVICE override (VD ép cpu trên máy có GPU dùng chung)
-        if os.environ.get("EMBED_DEVICE"):
-            self.device = os.environ["EMBED_DEVICE"].strip().lower()
         # tên biến chủ dự án đặt trong .env (BASEURL_EMBEDDING / APIKEY_EMBEDDING_MODEL / EMBEDDING_MODEL) dùng
         # làm dự phòng khi không có EMBED_*
         alt = {"api_base": "BASEURL_EMBEDDING", "api_key": "APIKEY_EMBEDDING_MODEL", "model": "EMBEDDING_MODEL",
@@ -149,8 +145,14 @@ class EmbeddingConfig:
         if self.image_provider not in ("jina", "hf-space"):
             raise ValueError(f"embedding.image_provider không hợp lệ: {self.image_provider!r}")
         self.backend = self.backend.lower()
-        if self.backend not in ("torch", "api"):
-            raise ValueError(f"embedding.backend không hợp lệ: {self.backend!r} (torch | api)")
+        if self.backend != "api":
+            raise ValueError(f"EMBED_BACKEND phải là api (nhận {self.backend!r})")
+        if not self.api_base and (self.text_provider != "hf-space" or self.image_provider != "hf-space"):
+            raise ValueError("thiếu EMBED_API_BASE cho HTTP embedding client")
+        if self.model not in ("jina-clip-v2", "jinaai/jina-clip-v2"):
+            raise ValueError("EMBED_MODEL phải là jina-clip-v2 cho index v3")
+        if self.dim != 1024:
+            raise ValueError("EMBED_DIM phải là 1024 cho index v3")
 
 
 @dataclass
@@ -327,6 +329,29 @@ class RetrievalConfig:
     # live (2026-11-10): 0,55 flag 11/80 (0 chặn nhầm), 0,63 flag 28 (21 chặn nhầm), 0,75 flag 72 (62
     # chặn nhầm — cosine câu ĐÚNG rải dày 0,58–0,72) → chủ duyệt giữ 0,55. 0 = tắt.
     weak_top_cosine: float = 0.55
+    # Retrieval upgrade: tất cả tính năng mới mặc định tắt để giữ nguyên baseline.
+    planner_mode: str = "baseline"          # baseline | shadow | candidate
+    entity_index_enabled: bool = False
+    entity_alias_path: str = ""              # artifact do owner kiểm duyệt, không chứa PII tự sinh
+    entity_alias_min_confidence: float = 0.85
+    entity_hard_filter_min_confidence: float = 0.95
+    entity_max_ambiguity: int = 1
+    entity_allow_ner: bool = False
+    entity_allow_llm_fallback: bool = False
+    entity_llm_timeout_ms: int = 1200
+    graph_route_on_relation: bool = True
+    graph_route_on_complexity: bool = True
+    graph_hard_filter: bool = False
+    text_candidate_limit: int = 50
+    media_candidate_limit: int = 32
+    max_retrieval_calls: int = 20
+    rerank_profile: str = "baseline_rrf"
+    rerank_top_n: int = 50
+    rerank_timeout_ms: int = 150
+    media_coupled_optional: bool = False
+    media_first_enabled: bool = False
+    parallel_multimodal_enabled: bool = False
+    audio_retrieval_enabled: bool = False
 
 
 @dataclass
@@ -375,7 +400,7 @@ def _build(data: dict[str, Any]) -> Settings:
         qdata["timeout"] = int(os.environ["QDRANT_TIMEOUT"])
     if os.environ.get("QDRANT_API_KEY"):
         qdata["api_key"] = os.environ["QDRANT_API_KEY"]
-    # cutover blue/green (D8): trỏ API/worker sang collection *_v2 mà không sửa yaml
+    # Chỉ cho phép bộ collection v3, bao gồm khi env override.
     if os.environ.get("QDRANT_COLLECTION_TEXT"):
         qdata["collection_text"] = os.environ["QDRANT_COLLECTION_TEXT"]
     if os.environ.get("QDRANT_COLLECTION_IMAGE"):

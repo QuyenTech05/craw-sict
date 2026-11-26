@@ -9,6 +9,11 @@ prometheus.scrape "embed" {
   }]
   scrape_interval = "${GCLOUD_SCRAPE_INTERVAL}"
   forward_to      = [prometheus.relabel.embed.receiver]
+
+  authorization {
+    type        = "Bearer"
+    credentials = sys.env("EMBED_API_KEY")
+  }
 }
 
 prometheus.relabel "embed" {
