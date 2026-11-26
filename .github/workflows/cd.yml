@@ -150,12 +150,18 @@ jobs:
             docker compose up -d postgres
             for i in $(seq 1 30); do docker compose exec -T postgres pg_isready -U sict -q && break; sleep 2; done
             bash scripts/store_auth.sh sync-pg
-            docker compose up -d postgres redis qdrant api nginx
+            docker compose up -d postgres redis qdrant api
+            # API có thể được recreate và nhận IP Docker mới; nginx phải được recreate
+            # sau API để không giữ upstream IP cũ trong worker process.
+            docker compose up -d --force-recreate nginx
             docker exec -u 0 craw-sict-api-1 chown -R 10000:10000 /cache/hf || true
             # cold start nạp model ~100 s → thử tới 5 phút
             for i in $(seq 1 30); do curl -sf -m 10 http://localhost:8003/app.js -o /dev/null && break; sleep 10; done
             curl -sf -m 10 http://localhost:8003/app.js -o /dev/null
-            curl -sf -m 10 http://localhost:8080/nginx-health -o /dev/null || echo "cảnh báo: nginx-health không trả lời"
+            curl -sf -m 10 http://localhost:8080/nginx-health -o /dev/null
+            # Post-check qua nginx: bắt lỗi stale Docker upstream trước khi CD thành công.
+            curl -sf -m 10 http://localhost:8080/healthz -o /dev/null
+            curl -sf -m 10 http://localhost:8080/readyz -o /dev/null
             # Cửa 1 (host nginx, TLS + redirect) — chỉ đụng khi máy đã cài file này và nội dung khác repo.
             # client_max_body_size của khối 80 là thứ CD không thể bỏ qua: thiếu nó thì POST ảnh lớn nhận 413.
             if sudo -n test -f /etc/nginx/conf.d/sict-http.conf 2>/dev/null; then
