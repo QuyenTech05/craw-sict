@@ -46,7 +46,10 @@ jobs:
     timeout-minutes: 25
     outputs:
       tag: ${{ steps.t.outputs.tag }}
+      prefix: ${{ steps.registry.outputs.prefix }}
     steps:
+      - id: registry
+        run: echo "prefix=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sict" >> "$GITHUB_OUTPUT"
       - name: Chỉ deploy từ main
         if: github.ref != 'refs/heads/main'
         run: |
@@ -72,7 +75,7 @@ jobs:
           for i in $(seq 1 40); do
             ok=1
             for img in api; do
-              docker manifest inspect "ghcr.io/${{ github.repository_owner }}/sict-$img:${{ steps.t.outputs.tag }}" >/dev/null || ok=0
+              docker manifest inspect "${{ steps.registry.outputs.prefix }}-$img:${{ steps.t.outputs.tag }}" >/dev/null || ok=0
             done
             [ "$ok" = 1 ] && exit 0
             sleep 30
@@ -85,7 +88,7 @@ jobs:
           if [[ '${{ inputs.target }}' == 'all' || '${{ inputs.target }}' == 'vm1' ]]; then images+=(api); fi
           if [[ '${{ inputs.deploy_embed }}' == 'true' && ( '${{ inputs.target }}' == 'all' || '${{ inputs.target }}' == 'vm2' ) ]]; then images+=(embed); fi
           for img in "${images[@]}"; do
-            docker manifest inspect "ghcr.io/${{ github.repository_owner }}/sict-$img:${{ steps.t.outputs.tag }}" >/dev/null \
+            docker manifest inspect "${{ steps.registry.outputs.prefix }}-$img:${{ steps.t.outputs.tag }}" >/dev/null \
               || { echo "thiếu ghcr.io/…/sict-$img:${{ steps.t.outputs.tag }} — chờ workflow release-images"; exit 1; }
           done
 
@@ -110,7 +113,7 @@ jobs:
       - name: Pull + up (infra, api, nginx)
         uses: appleboy/ssh-action@v1
         env:
-          API_IMAGE: ghcr.io/${{ github.repository_owner }}/sict-api:${{ needs.prepare.outputs.tag }}
+          API_IMAGE: ${{ needs.prepare.outputs.prefix }}-api:${{ needs.prepare.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_ACTOR: ${{ github.actor }}
         with:
@@ -181,7 +184,7 @@ jobs:
       - name: Kiểm artifact ONNX dựng sẵn + up embed
         uses: appleboy/ssh-action@v1
         env:
-          EMBED_IMAGE: ghcr.io/${{ github.repository_owner }}/sict-embed:${{ needs.prepare.outputs.tag }}
+          EMBED_IMAGE: ${{ needs.prepare.outputs.prefix }}-embed:${{ needs.prepare.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_ACTOR: ${{ github.actor }}
         with:

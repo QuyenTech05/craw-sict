@@ -21,6 +21,8 @@ from sict_crawler.service.embedding import embedder
 from sict_crawler.service.retrieval import filters as F
 from sict_crawler.service.retrieval.sources import media_sources, text_sources
 
+OCR_CACHE_SCOPE = contextvars.ContextVar("ocr_cache_scope", default="")
+
 QUERY_TTL = 600      # kết quả retrieve theo câu hỏi (giây)
 DOC_MEDIA_LIMIT = 32  # A: số ảnh / khung hình tối đa lấy từ các bài chữ đứng đầu (gate chia lượt theo hit chữ)
 # Tầng GIAI ĐOẠN của truy vấn song song (2026-10-25): nhúng ảnh truy vấn, nhánh media chạy cùng nhánh chữ. Tầng dưới là
@@ -42,6 +44,8 @@ def query_cache_key(question: str, top_k: int, filters_key: str = "", index: str
     namespace = os.environ.get("SICT_EVAL_CACHE_NAMESPACE", "")
     if namespace:
         index = f"{index}|eval:{namespace}"
+    if scope := OCR_CACHE_SCOPE.get():
+        index = f"{index}|ocr:{scope}"
     return "q:v14:" + hashlib.sha256(   # v14: không tái sử dụng cache trước khi ghi trạng thái ảnh
         f"{question}\x00{top_k}\x00{filters_key}\x00{index}".encode()).hexdigest()
 

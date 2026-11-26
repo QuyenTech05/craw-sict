@@ -2,7 +2,7 @@
 
 Runner `sandbox/job_runner.py` thực thi job có checkpoint trên VM-SERVE. Lệnh khởi tạo
 Sandbox qua SDK là `node launch-sandbox.mjs <job_id>` trong thư mục `vercel/`
-(cấu hình OIDC/token Vercel, Git URL allowlist, commit SHA, Job API HTTPS, owner token và `SICT_SANDBOX_IMAGE` trỏ custom image VCR). Launcher chỉ truyền capability theo job; OCR token chỉ cấp cho OCR.
+(cấu hình OIDC/token Vercel, Git URL allowlist, commit SHA, Job API HTTPS, owner token và `SICT_SANDBOX_IMAGE` trỏ custom image VCR pin @sha256 digest). Launcher chỉ truyền capability theo job; OCR token chỉ cấp cho OCR.
 
 Trước khi chạy, tạo job qua `POST /internal/jobs`, upload `input/items.json` và
 các ảnh/video/snapshot vào `input/` qua API checksum. `items.json` có dạng

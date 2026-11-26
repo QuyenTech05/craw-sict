@@ -4,6 +4,7 @@ import base64
 import io
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -96,7 +97,7 @@ def test_ocr_requery_failure_does_not_reuse_unrelated_visual_sources(monkeypatch
         raise RuntimeError("index offline")
 
     monkeypatch.setattr(agent, "run", unavailable)
-    original = {**_result(sufficient=True), "text": [Source(
+    original = {**_result(sufficient=False), "text": [Source(
         url="https://sict.haui.edu.vn/vn/khac", title="Không liên quan", kind="text", score=0.5)]}
     output = asyncio.run(mvp_ocr.add_query_ocr(QueryIn(question="Đọc chữ poster", image=IMAGE), original))
     assert output["ocr"]["status"] == "unverified"
@@ -178,3 +179,46 @@ def test_hybrid_chat_ocr_after_retrieval_before_answer(monkeypatch):
     assert events[0]["status"]["ocr"]["status"] == "ok"
     assert events[-1]["citations"][0]["url"].endswith("hoi-thao-ai")
     assert response.text.endswith("data: [DONE]\n\n")
+
+
+@pytest.mark.parametrize("body,status", [([], "unavailable"), ({"text": "  "}, "empty")])
+def test_ocr_bad_or_empty_response_preserves_visual(monkeypatch, body, status):
+    monkeypatch.setenv("MVP_OCR_POLICY", "always")
+    monkeypatch.setenv("MVP_OCR_URL", "https://demo.vercel.app/api/ocr")
+    monkeypatch.setenv("MVP_OCR_TOKEN", "key")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=body)))
+    monkeypatch.setattr(mvp_ocr.httpx, "AsyncClient", lambda **kwargs: client)
+    original = _result()
+    outcome = asyncio.run(mvp_ocr.add_query_ocr(QueryIn(question="Đọc chữ", image=IMAGE), original))
+    assert outcome == {**original, "ocr": {"status": status}}
+
+
+def test_ocr_out_of_scope_skips_network(monkeypatch):
+    monkeypatch.setenv("MVP_OCR_POLICY", "always")
+    original = {**_result(False), "oos": True}
+    outcome = asyncio.run(mvp_ocr.add_query_ocr(QueryIn(question="Đọc chữ", image=IMAGE), original))
+    assert outcome is original
+
+
+def test_ocr_weak_requery_keeps_verified_visual_and_isolates_cache(monkeypatch):
+    from sict_crawler.service.retrieval import agent, retriever
+    monkeypatch.setenv("MVP_OCR_POLICY", "always")
+    monkeypatch.setenv("MVP_OCR_URL", "https://demo.vercel.app/api/ocr")
+    monkeypatch.setenv("MVP_OCR_TOKEN", "key")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, json={"text": "Hội thảo AI"})))
+    monkeypatch.setattr(mvp_ocr.httpx, "AsyncClient", lambda **kwargs: client)
+    keys = []
+    def search(question, top_k, image, filters):
+        keys.append(retriever.query_cache_key(question, top_k))
+        assert retriever.OCR_CACHE_SCOPE.get()
+        return {**_result(), "text": [Source(url="https://example.com/fake", title="Fake", kind="text", score=1)]}
+    monkeypatch.setattr(agent, "run", search)
+    original = {**_result(), "text": [Source(url="https://sict.haui.edu.vn/vn/verified", title="Verified", kind="text", score=0.9)]}
+    outcome = asyncio.run(mvp_ocr.add_query_ocr(QueryIn(question="Đọc chữ", image=IMAGE), original))
+    assert outcome["text"] == original["text"]
+    assert outcome["sufficient"] is True
+    assert outcome["context"].startswith(original["context"])
+    assert "Hội thảo AI" in outcome["context"]
+    assert outcome["ocr"]["source_verified"] is False
+    assert keys != [retriever.query_cache_key("Đọc chữ\nHội thảo AI", 8)]
+    assert not retriever.OCR_CACHE_SCOPE.get()

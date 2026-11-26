@@ -7,9 +7,9 @@ const jobId = '3f0c2a4e-7839-41e4-86f1-69c4a1434319';
 async function withEnvironment(callback) {
   const variables = {
     SICT_GIT_URL: 'https://github.com/quyentech05/craw-sict.git',
-    SICT_GIT_REF: 'a'.repeat(40),
+    SICT_GIT_SHA: 'a'.repeat(40),
     SICT_API_BASE: 'https://demo-vm.example',
-    SICT_SANDBOX_IMAGE: 'sict/sandbox:prebuilt-v1',
+    SICT_SANDBOX_IMAGE: 'sict/sandbox@sha256:' + 'b'.repeat(64),
     MVP_JOB_TOKEN: 'test-token',
     MVP_OCR_URL: 'https://demo-ocr.vercel.app/api/ocr',
     MVP_OCR_TOKEN: 'test-ocr-token',
@@ -48,7 +48,7 @@ test('launcher checkout đúng cwd, giới hạn thời gian, truyền env và �
     });
     assert.equal(code, 0);
     assert.equal(created.source.revision, 'a'.repeat(40));
-    assert.equal(created.image, 'sict/sandbox:prebuilt-v1');
+    assert.equal(created.image, 'sict/sandbox@sha256:' + 'b'.repeat(64));
     assert.equal(created.persistent, false);
     assert.equal(created.resources.vcpus, 2);
     assert.equal(created.timeout, 43 * 60 * 1000);
@@ -82,10 +82,10 @@ test('launcher luôn stop khi lệnh thất bại', async () => {
 
 test('launcher từ chối Git branch, fork và checkout sai SHA', async () => {
   await withEnvironment(async () => {
-    const original = process.env.SICT_GIT_REF;
-    process.env.SICT_GIT_REF = 'main';
+    const original = process.env.SICT_GIT_SHA;
+    process.env.SICT_GIT_SHA = 'main';
     await assert.rejects(launchSandbox(jobId), /immutable commit SHA/);
-    process.env.SICT_GIT_REF = original;
+    process.env.SICT_GIT_SHA = original;
     process.env.SICT_GIT_URL = 'https://github.com/attacker/craw-sict.git';
     await assert.rejects(launchSandbox(jobId), /repository SICT tin cậy/);
     process.env.SICT_GIT_URL = 'https://github.com/quyentech05/craw-sict.git';
@@ -130,5 +130,15 @@ test('report job chỉ nhận capability report, không nhận OCR token', async
       }
       return { kind: 'graph-stats', status: 'queued' };
     } });
+  });
+});
+
+
+test('launcher từ chối image mutable trước khi gọi Job API', async () => {
+  await withEnvironment(async () => {
+    process.env.SICT_SANDBOX_IMAGE = 'sict/sandbox:latest';
+    await assert.rejects(launchSandbox(jobId, { jobClient: async () => {
+      throw new Error('Không được gọi Job API');
+    } }), /sha256 digest/);
   });
 });

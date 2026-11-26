@@ -54,6 +54,8 @@ def _cache_lookup(state: RetrievalState) -> dict:
         'retrieval': asdict(settings.retrieval), 'router': asdict(settings.router),
         'graph': asdict(settings.graph),
     }
+    if scope := retriever.OCR_CACHE_SCOPE.get():
+        identity['ocr_scope'] = scope
     key = 'gq:v1:' + hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     try:
         raw = cache.get(key)
