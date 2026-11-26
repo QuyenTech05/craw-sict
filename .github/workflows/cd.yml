@@ -114,6 +114,9 @@ jobs:
         uses: appleboy/ssh-action@v1
         env:
           API_IMAGE: ${{ needs.prepare.outputs.prefix }}-api:${{ needs.prepare.outputs.tag }}
+          MVP_OCR_POLICY: ${{ secrets.MVP_OCR_POLICY }}
+          MVP_OCR_URL: ${{ secrets.MVP_OCR_URL }}
+          MVP_OCR_TOKEN: ${{ secrets.MVP_OCR_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_ACTOR: ${{ github.actor }}
         with:
@@ -121,7 +124,7 @@ jobs:
           port: ${{ vars.VM1_SSH_PORT || 22 }}
           username: ${{ vars.VM_SSH_USER || 'ubuntu' }}
           key: ${{ secrets.VM1_KEY }}
-          envs: API_IMAGE,GH_TOKEN,GH_ACTOR
+          envs: API_IMAGE,MVP_OCR_POLICY,MVP_OCR_URL,MVP_OCR_TOKEN,GH_TOKEN,GH_ACTOR
           command_timeout: 25m
           script: |
             set -euo pipefail
@@ -129,10 +132,16 @@ jobs:
             touch .env
             # D12: thiếu / yếu mật khẩu store hoặc STORE_BIND → dừng trước khi đổi gì (tạo: scripts/store_auth.sh init-env)
             bash scripts/store_auth.sh check vm1
-            upsert() { if grep -q "^$1=" .env; then sed -i "s#^$1=.*#$1=$2#" .env; else echo "$1=$2" >> .env; fi; }
+            upsert() { if grep -q "^$1=" .env; then sed -i "s#^$1=.*#$1=$2#" .env; else printf '%s=%s\n' "$1" "$2" >> .env; fi; }
             prev="$(grep '^API_IMAGE=' .env | cut -d= -f2- || true)"
             [ -n "$prev" ] && [ "$prev" != "$API_IMAGE" ] && upsert API_IMAGE_PREV "$prev"
             upsert API_IMAGE "$API_IMAGE"
+            # Vercel OCR fallback: values come from the production Environment secrets.
+            # Do not print these values; .env stays only on VM-SERVE.
+            [ -n "$MVP_OCR_POLICY" ] && upsert MVP_OCR_POLICY "$MVP_OCR_POLICY"
+            [ -n "$MVP_OCR_URL" ] && upsert MVP_OCR_URL "$MVP_OCR_URL"
+            [ -n "$MVP_OCR_TOKEN" ] && upsert MVP_OCR_TOKEN "$MVP_OCR_TOKEN"
+            chmod 600 .env
             echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
             docker compose pull api
             docker logout ghcr.io
