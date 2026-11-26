@@ -96,10 +96,22 @@ def test_http_contract_matches_embedder_client(monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
     monkeypatch.setenv("EMBED_API_KEY", "embed-private-key")
-    with TestClient(S.create_app(FakeEncoder())) as c:
+    encoder = FakeEncoder()
+    calls = []
+    original_texts = encoder.texts
+
+    def record_texts(texts):
+        calls.append(texts)
+        return original_texts(texts)
+
+    monkeypatch.setattr(encoder, "texts", record_texts)
+    with TestClient(S.create_app(encoder)) as c:
         assert c.get("/healthz").json()["ok"] is True
         assert "requests" not in c.get("/healthz").json()
         assert c.post("/v1/embeddings", json={"input": "a"}).status_code == 401
+        assert c.post("/v1/embeddings", json={"input": "a"},
+                      headers={"Authorization": "Bearer wrong-key"}).status_code == 401
+        assert calls == []
         assert c.get("/metrics").status_code == 401
         c.headers.update({"Authorization": "Bearer embed-private-key"})
         r = c.post("/v1/embeddings", json={"model": "jina-clip-v2", "normalized": True, "dimensions": 256,

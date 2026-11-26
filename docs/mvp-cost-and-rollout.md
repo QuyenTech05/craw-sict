@@ -20,7 +20,7 @@ Lập bảng tháng theo số ảnh OCR, % fallback, cold start, tổng số ph�
 2. Khởi động VM-EMBED với model ONNX INT8 đã chuẩn bị và `EMBED_CONCURRENCY=1`, kiểm tra chiều vector 1024 và endpoint health/embedding.
 3. Xác minh `/query`, `/chat` và image retrieval sử dụng index `*_v3`; không bật OCR khi chưa có kết quả baseline.
 4. Cấu hình Vercel Project từ thư mục `vercel/`, set `MVP_OCR_TOKEN`, `MVP_JOB_TOKEN`, `SICT_API_BASE`, `OCR_IMAGE_HOSTS` (nếu dùng image_url) và `TESSDATA_URL` (nếu dùng mirror). Thử `/api/ocr`, `/api/ocr-batch` và job proxy, sau đó mới đặt `MVP_OCR_POLICY=weak` ở VM API.
-5. Với backlog thật, tạo job và upload manifest/input trước, cấu hình SDK, `SICT_GIT_URL` allowlist, `SICT_GIT_REF` SHA bất biến và `SICT_SANDBOX_IMAGE` đã chuẩn bị trên VCR, rồi khởi chạy `vercel/launch-sandbox.mjs`. Dùng snapshot/compute nhỏ, video hoặc OCR có kiểm soát; kiểm chứng resume và SHA256.
+5. Với backlog thật, tạo job và upload manifest/input trước, cấu hình SDK, `SICT_GIT_URL` allowlist, `SICT_GIT_SHA` SHA bất biến và `SICT_SANDBOX_IMAGE` đã chuẩn bị trên VCR, pin @sha256 digest, rồi khởi chạy `vercel/launch-sandbox.mjs`. Dùng snapshot/compute nhỏ, video hoặc OCR có kiểm soát; kiểm chứng resume và SHA256.
 6. Ghi latency, OOM/restart, timeout, số case eligible và chi phí usage; đối chiếu `docs/mvp-evaluation-report.md` trước khi tăng traffic.
 
 ## Dừng và khôi phục demo

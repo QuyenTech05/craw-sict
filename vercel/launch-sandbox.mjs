@@ -10,16 +10,19 @@ export async function launchSandbox(jobId, {
   sdk = Sandbox, jobClient = jobApi, output = process.stdout, error = process.stderr,
 } = {}) {
   const source = process.env.SICT_GIT_URL;
-  const revision = process.env.SICT_GIT_REF;
+  const revision = process.env.SICT_GIT_SHA;
   const api = process.env.SICT_API_BASE;
   const token = process.env.MVP_JOB_TOKEN;
   const image = process.env.SICT_SANDBOX_IMAGE;
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(jobId || '')
       || !source || !revision || !api || !token || !image) {
-    throw new Error('Cần job_id, SICT_GIT_URL, SICT_GIT_REF (SHA), SICT_API_BASE, MVP_JOB_TOKEN, SICT_SANDBOX_IMAGE');
+    throw new Error('Cần job_id, SICT_GIT_URL, SICT_GIT_SHA, SICT_API_BASE, MVP_JOB_TOKEN, SICT_SANDBOX_IMAGE');
   }
   if (source !== TRUSTED_REPOSITORY || !/^[0-9a-f]{40}$/.test(revision)) {
     throw new Error('Chỉ cho phép repository SICT tin cậy và immutable commit SHA 40 ký tự');
+  }
+  if (!/^(?:vcr\.vercel\.com\/)?[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/.test(image)) {
+    throw new Error('SICT_SANDBOX_IMAGE phải là VCR image pin bằng sha256 digest');
   }
   if (!api.startsWith('https://')) {
     throw new Error('Job API URL phải dùng HTTPS');
