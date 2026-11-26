@@ -31,7 +31,9 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
+from collections import Counter
 from pathlib import Path
 
 SEP = "\n\n---\n\n"           # sources.build_context nối các phần bằng chuỗi này
@@ -72,8 +74,14 @@ def questions(args) -> list[dict]:
             ref = g.get("reference")
             if ref is None and g.get("expected_items"):
                 ref = "Các mục cần có: " + "; ".join(alts[0] for alts in g["expected_items"]) + "."
+            image_path = g.get("image")
+            if image_path:
+                image_path = Path(image_path)
+                if not image_path.is_absolute():
+                    image_path = Path(path).resolve().parent.parent / image_path
             rows.append({"id": f"{kind}:{g.get('id', len(rows))}", "set": kind, "question": g["question"],
                          "image": g.get("image"), "filters": g.get("filters"), "reference": ref,
+                         "image_path": str(image_path) if image_path else None,
                          **{k: g[k] for k in ("case", "style", "answerable", "expected_urls", "variant_of",
                                               "expected_items") if k in g}})
     return rows[:args.limit] if args.limit else rows
@@ -95,7 +103,7 @@ def image_base64(q: dict) -> str | None:
     """Ảnh của golden là đường dẫn tính từ gốc repo; API nhận base64 thuần."""
     if not q.get("image"):
         return None
-    path = Path(q["image"])
+    path = Path(q.get("image_path") or q["image"])
     if not path.is_absolute():
         path = Path(__file__).resolve().parent.parent / path
     if not path.is_file():
@@ -107,23 +115,32 @@ def request_body(q: dict, top_k: int, image: str | None) -> dict:
     return {"question": q["question"], "top_k": top_k, "filters": q["filters"], "image": image}
 
 
-def chat(api: str, q: dict, top_k: int, timeout: int, image: str | None = None) -> str:
-    deltas, answer = [], None
-    with post(api, "/chat", request_body(q, top_k, image), timeout) as r:
+def chat(api: str, q: dict, top_k: int, timeout: int) -> tuple[str, list[dict], bool]:
+    deltas, statuses, answer, finished = [], [], None, False
+    body = {"question": q["question"], "top_k": top_k, "filters": q["filters"]}
+    if q.get("image_b64"):
+        body["image"] = q["image_b64"]
+    with post(api, "/chat", body, timeout) as r:
         for raw in r:
             line = raw.decode("utf-8").strip()
-            if not line.startswith("data: ") or line == "data: [DONE]":
+            if line == "data: [DONE]":
+                finished = True
+                break
+            if not line.startswith("data: "):
                 continue
             d = json.loads(line[6:])
             if "delta" in d:
                 deltas.append(d["delta"])
             if "answer" in d:
                 answer = d["answer"]
-    return answer or "".join(deltas)
+            if "status" in d:
+                statuses.append(d["status"])
+    return answer or "".join(deltas), statuses, finished
 
 
 def collect(args) -> None:
     out = Path(f"{args.out}.answers.jsonl")
+    skipped = Path(f"{args.out}.skipped.jsonl")
     out.parent.mkdir(parents=True, exist_ok=True)
     have = done_ids(out)
     selected = questions(args)
@@ -133,66 +150,84 @@ def collect(args) -> None:
             old = previous.get(q["id"])
             if old and any(old.get(k) != q.get(k) for k in ("question", "image", "filters", "reference")):
                 raise ValueError(f"{q['id']}: golden đã đổi sau collect; dùng --out mới để đo lại")
-            if old and q.get("image") and not old.get("image_sent"):
+            if old and q.get("image") and not old.get("image_sent", old.get("image_input")):
                 raise ValueError(f"{q['id']}: kết quả cũ chưa gửi ảnh; dùng --out mới để đo lại")
-    # Giới hạn tốc độ chung cho cả /query và /chat, kể cả khi nhiều câu chạy đồng thời.
-    # /query có thể gọi LLM router, do đó mỗi request đều chiếm một lượt trong ngân sách.
+
     gap = 60.0 / args.rpm
     gate = threading.Lock()
-    next_request = [0.0]
+    next_request = 0.0
 
     def throttle() -> None:
+        nonlocal next_request
         with gate:
-            pause = next_request[0] - time.monotonic()
+            pause = next_request - time.monotonic()
             if pause > 0:
                 time.sleep(pause)
-            next_request[0] = time.monotonic() + gap
+            next_request = time.monotonic() + gap
 
-    def collect_one(q: dict) -> dict | None:
+    def collect_one(q: dict) -> tuple[dict | None, str | None]:
         image = image_base64(q)
+        body = request_body(q, args.top_k, image)
+        reason = None
         for attempt in range(4):
-            throttle()
-            t = time.time()
-            with post(args.api, "/query", request_body(q, args.top_k, image), args.timeout) as r:
-                res = json.loads(r.read())
-            t_query = time.time() - t
-            throttle()
-            t0_chat = time.time()
-            ans = chat(args.api, q, args.top_k, args.timeout, image)
-            t_chat = time.time() - t0_chat
-            if not ans.startswith(ECHO):
-                break
-            print(f"{q['id']} LLM không trả lời (hết lượt?), chờ 60 s", flush=True)
-            time.sleep(60)
-        else:
-            print(f"{q['id']} bỏ qua: LLM không trả lời sau 4 lần", flush=True)
-            return None
-        contexts = [c for c in res.get("context", "").split(SEP) if c.strip()]
-        row = {**q, "image_sent": image is not None, "answer": ans, "contexts": contexts,
-               "sufficient": res.get("sufficient"),
-               "list_question": res.get("list_question"), "urls": [s["url"] for s in res.get("text", [])],
-               "media_urls": [s.get("url") for s in res.get("media", [])],
-               "latency_s": {"query": round(t_query, 2), "chat": round(t_chat, 2)}}
-        print(f"{q['id']} {time.time() - t:.1f}s nguồn={len(contexts)} trả lời={len(ans)} ký tự", flush=True)
-        return row
+            try:
+                throttle()
+                t = time.monotonic()
+                with post(args.api, "/query", body, args.timeout) as r:
+                    res = json.loads(r.read())
+                t_query = time.monotonic() - t
+                if image and res.get("image_status") != "ok":
+                    return None, f"image_embedding_{res.get('image_status') or 'unknown'}"
+                throttle()
+                t0_chat = time.monotonic()
+                ans, statuses, finished = chat(args.api, {**q, "image_b64": image}, args.top_k, args.timeout)
+                t_chat = time.monotonic() - t0_chat
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                reason = f"request_error: {type(exc).__name__}: {str(exc)[:180]}"
+            else:
+                if image and any(s.get("image_status") == "embedding_failed" for s in statuses):
+                    return None, "image_embedding_failed"
+                incomplete = any(s.get("generation") == "incomplete" for s in statuses)
+                if any(s.get("error_code") == "http_4xx" for s in statuses):
+                    return None, "generation_http_4xx"
+                if ans.strip() and not ans.startswith(ECHO) and finished and not incomplete:
+                    contexts = [c for c in res.get("context", "").split(SEP) if c.strip()]
+                    row = {**q, "image_sent": bool(image), "image_input": bool(image),
+                           "image_status": res.get("image_status"), "finished": finished,
+                           "generation_incomplete": incomplete, "answer": ans, "contexts": contexts,
+                           "sufficient": res.get("sufficient"), "list_question": res.get("list_question"),
+                           "urls": [s["url"] for s in res.get("text", [])],
+                           "media_urls": [s.get("url") for s in res.get("media", [])],
+                           "latency_s": {"query": round(t_query, 2), "chat": round(t_chat, 2)}}
+                    row.pop("image_path", None)
+                    print(f"{q['id']} nguồn={len(contexts)} trả lời={len(ans)} ký tự", flush=True)
+                    return row, None
+                reason = "generation_incomplete" if incomplete or not finished else "fallback_or_empty_answer"
+            if attempt < 3:
+                print(f"{q['id']} {reason}, thử lại sau 60 s", flush=True)
+                time.sleep(60)
+        return None, reason or "generation_failed_after_retries"
 
     pending = [q for q in selected if q["id"] not in have]
     errors = []
     with ThreadPoolExecutor(max_workers=max(1, getattr(args, "concurrency", 1))) as pool:
         futures = {pool.submit(collect_one, q): q for q in pending}
         for future in as_completed(futures):
+            qid = futures[future]["id"]
             try:
-                row = future.result()
+                row, reason = future.result()
             except Exception as exc:
-                errors.append((futures[future]["id"], exc))
-                print(f"{futures[future]['id']} lỗi collect: {type(exc).__name__}: {exc}", flush=True)
-                continue
-            if row:
-                # Chỉ luồng chính append, tránh xen lẫn JSONL khi nhiều câu xong cùng lúc.
+                errors.append(exc)
+                row, reason = None, f"{'image_read_error' if isinstance(exc, OSError) else 'collect_error'}: {exc}"
+            if row is not None:
                 with out.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            else:
+                with skipped.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"id": qid, "reason": reason}, ensure_ascii=False) + "\n")
+                print(f"{qid} bỏ qua: {reason}", flush=True)
     if errors:
-        raise errors[0][1] if len(errors) == 1 else RuntimeError(f"{len(errors)} câu collect lỗi; chạy lại để tiếp tục")
+        raise errors[0] if len(errors) == 1 else RuntimeError(f"{len(errors)} câu collect lỗi; chạy lại để tiếp tục")
 
 
 class RateLimiter:
@@ -310,7 +345,10 @@ async def score_all(args) -> None:
     metrics = {"faithfulness": Faithfulness(llm=llm), "answer_relevancy": AnswerRelevancy(llm=llm, embeddings=emb),
                "context_precision": ContextPrecisionWithoutReference(llm=llm), "context_recall": ContextRecall(llm=llm)}
     use = [m for m in args.metrics.split(",") if m]
-    rows = [json.loads(x) for x in Path(f"{args.out}.answers.jsonl").read_text(encoding="utf-8").splitlines() if x]
+    collected = [json.loads(x) for x in Path(f"{args.out}.answers.jsonl").read_text(encoding="utf-8").splitlines() if x]
+    excluded = Counter(reason for r in collected if (reason := score_exclusion(r, allow_image_only=True)))
+    rows = [r for r in collected if score_exclusion(r, allow_image_only=True) is None]
+    print(f"RAGAS đủ điều kiện {len(rows)}/{len(collected)}; loại {dict(excluded)}", flush=True)
     out = Path(f"{args.out}.scores.jsonl")
     have = done_ids(out)
     # --retry-errors: chấm lại đúng các chỉ số bị lỗi (504 / timeout của LLM chấm), giữ nguyên chỉ số đã có
@@ -398,6 +436,25 @@ def abstained(answer: str) -> bool:
     return bool(ABSTAIN_RE.search(_fold(answer)))
 
 
+def score_exclusion(row: dict, *, allow_image_only: bool = False) -> str | None:
+    """Không đưa các lượt không có đầu ra hợp lệ vào mẫu số RAGAS."""
+    if row.get("error"):
+        return "request_error"
+    if row.get("image_input") and row.get("image_status") != "ok":
+        return "image_embedding_failed"
+    if row.get("generation_incomplete") or row.get("finished") is False:
+        return "generation_incomplete"
+    if row.get("fallback") or (row.get("answer") or "").startswith(ECHO):
+        return "llm_fallback"
+    if not (row.get("answer") or "").strip():
+        return "empty_answer"
+    if not (row.get("question") or "").strip() and not (allow_image_only and row.get("image_sent", row.get("image_input"))):
+        return "image_only_no_text_for_judge"
+    if row.get("answerable") is False:
+        return "unanswerable"
+    return None
+
+
 def _mean(vals):
     vals = [v for v in vals if v is not None]
     return (round(sum(vals) / len(vals), 3), len(vals)) if vals else (None, 0)
@@ -450,7 +507,7 @@ def coverage(expected: list[dict], answers: dict, scored: dict, use: list[str]) 
             if a is None:
                 reason = "not_collected"
             else:
-                reason = metric_skip_reason({**a, **q}, name)
+                reason = score_exclusion({**a, **q}, allow_image_only=True) or metric_skip_reason({**a, **q}, name)
                 if reason is None and q["id"] not in scored:
                     reason = "not_scored"
                 if reason is None and scored[q["id"]].get(name) is None:
@@ -474,11 +531,24 @@ def summary(path: Path, use: list[str], expected: list[dict] | None = None) -> N
         selected_ids = {q["id"] for q in expected}
         rows = [r for r in rows if r["id"] in selected_ids]
         answers = {i: a for i, a in answers.items() if i in selected_ids}
+    rows = [r for r in rows if r["id"] in answers and score_exclusion(answers[r["id"]], allow_image_only=True) is None]
     for r in rows:   # bộ cũ: cột case/style chỉ có trong answers
         for k in ("case", "style", "answerable", "variant_of"):
             if k not in r and k in answers.get(r["id"], {}):
                 r[k] = answers[r["id"]][k]
     table = {}
+    excluded = Counter(reason for a in answers.values() if (reason := score_exclusion(a, allow_image_only=True)))
+    skipped_path = Path(str(path).replace('.scores.jsonl', '.skipped.jsonl'))
+    skipped = {r['id']: r['reason'] for r in (json.loads(x) for x in skipped_path.read_text(encoding='utf-8').splitlines() if x.strip())} \
+        if skipped_path.exists() else {}
+    if expected is not None:
+        skipped = {i: reason for i, reason in skipped.items() if i in selected_ids}
+    for answered_id in answers:
+        skipped.pop(answered_id, None)
+    excluded.update(skipped.values())
+    table["collection"] = {"n_collected": len(answers), "n_eligible": sum(score_exclusion(a, allow_image_only=True) is None for a in answers.values()),
+                            "n_skipped": len(skipped), "n_requested": len(answers) + len(skipped),
+                            "excluded": dict(excluded)}
     for s in sorted({r["set"] for r in rows}) + ["all"]:
         table[s] = _group([r for r in rows if s == "all" or r["set"] == s], answers, use)
     if expected is not None:
@@ -495,13 +565,13 @@ def summary(path: Path, use: list[str], expected: list[dict] | None = None) -> N
                                  "bien_the": _mean([v.get(m) for v, _ in pairs])[0]}
                              for m in use if any(v.get(m) is not None for v, _ in pairs)}
         table["variants"]["n_pairs"] = len(pairs)
-    # độ trễ từ collect (latency_s.{query,chat} trong answers.jsonl): p50/p90
+    # độ trễ từ collect (latency_s.{query,chat} trong answers.jsonl): p50/p95
     lat = [a.get("latency_s") for a in answers.values() if a.get("latency_s")]
     if lat:
         def _pct(vals, p):
             vals = sorted(vals)
             return vals[min(len(vals) - 1, int(round(p / 100 * (len(vals) - 1))))]
-        table["latency_s"] = {k: {"p50": _pct([x[k] for x in lat], 50), "p90": _pct([x[k] for x in lat], 90),
+        table["latency_s"] = {k: {"p50": _pct([x[k] for x in lat], 50), "p95": _pct([x[k] for x in lat], 95),
                                   "mean": round(sum(x[k] for x in lat) / len(lat), 2), "n": len(lat)}
                               for k in ("query", "chat")}
     print(json.dumps(table, ensure_ascii=False, indent=1))

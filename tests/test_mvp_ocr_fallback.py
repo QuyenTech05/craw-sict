@@ -1,15 +1,19 @@
 """OCR Vercel chỉ chạy sau retrieval và khi opt-in, degrade gracefully."""
 import asyncio
 import base64
+import io
 
 import httpx
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from sict_crawler.api import mvp_ocr
 from sict_crawler.model.schemas import QueryIn, Source
 
 
-IMAGE = base64.b64encode(bytes.fromhex("89504e470d0a1a0a0000000d49484452")).decode()
+with io.BytesIO() as buffer:
+    Image.new("RGB", (2, 2)).save(buffer, format="PNG")
+    IMAGE = base64.b64encode(buffer.getvalue()).decode()
 
 
 def _result(sufficient=True):
@@ -121,7 +125,7 @@ def test_ocr_skips_unneeded_or_invalid_inputs(monkeypatch):
     monkeypatch.setenv("MVP_OCR_TOKEN", "key")
     enough = _result()
     assert asyncio.run(mvp_ocr.add_query_ocr(QueryIn(question="Ai trong ảnh?", image=IMAGE), enough)) is enough
-    invalid = asyncio.run(mvp_ocr.add_query_ocr(QueryIn(question="Đọc chữ", image="??"), enough))
+    invalid = asyncio.run(mvp_ocr.add_query_ocr(QueryIn.model_construct(question="Đọc chữ", image="??"), enough))
     assert invalid["ocr"] == {"status": "skipped", "reason": "invalid_image"}
 
 
@@ -157,10 +161,12 @@ def test_hybrid_chat_ocr_after_retrieval_before_answer(monkeypatch):
             kind="text", score=0.95, cite="Hội thảo AI")],
     })
 
-    def stream_answer(question, context, image):
+    def stream_answer(question, context, image, *, state=None):
         stages.append("answer")
         assert "Hội thảo AI" in context
         yield "Hội thảo AI"
+        if state is not None:
+            state["finish"] = "done"
 
     monkeypatch.setattr(prompt_cache, "stream_answer_cached", stream_answer)
     with TestClient(app) as api_client:

@@ -373,11 +373,13 @@ def answer_prompt(question: str, context: str) -> str:
     return f"{ANSWER_RULES}\n\nNgữ cảnh:\n{context}\n\nCâu hỏi: {question}"
 
 
-def stream_answer(question: str, context: str, image_b64: str | None = None, max_tokens: int | None = None):
+def stream_answer(question: str, context: str, image_b64: str | None = None, max_tokens: int | None = None, *, state: dict | None = None):
     """Yield answer chunks from cfg.llm given retrieved context. SSE-style text.
     Yields nothing if no key/call fails (caller falls back to echo context).
     image_b64: ảnh người dùng gửi (D21) — chỉ đưa vào lượt gọi khi llm.answer_with_image bật; mặc định
     LLM chỉ thấy chữ đã truy xuất."""
+    state = state if state is not None else {}
+    state.update(finish='error', error_code='empty')
     cfg = get_settings().llm
     if not cfg.api_key:
         return
@@ -402,11 +404,12 @@ def stream_answer(question: str, context: str, image_b64: str | None = None, max
     # gateway chứ không ở độ dài suy nghĩ. Câu trả lời đến một lần thay vì từng mẩu.
     attempts = 1 + max(0, int(getattr(cfg, "stream_retries", 0)))
     for attempt in range(1, attempts + 1):
-        st = {"wrote": 0, "thought": 0, "retry": False}
+        st = {"wrote": 0, "thought": 0, "retry": False, "finish": "error", "error_code": "empty"}
         if attempt == 1:
             yield from _stream_once(cfg, body, st)
         else:
             yield from _complete_once(cfg, {**body, "stream": False}, st)
+        state.update(finish=st['finish'], error_code=st.get('error_code'))
         if st["wrote"] or not st["retry"]:
             break
         if attempt < attempts:
@@ -425,15 +428,18 @@ def _complete_once(cfg, body: dict, st: dict):
         if r.status_code != 200:
             print(f"[llm] stream_answer HTTP {r.status_code}: {r.text[:300]}")
             st["retry"] = r.status_code >= 500 or r.status_code == 429
+            st['error_code'] = 'http_429' if r.status_code == 429 else 'http_5xx' if r.status_code >= 500 else 'http_4xx'
             return
         msg = ((r.json().get("choices") or [{}])[0].get("message") or {})
         st["thought"] += len(msg.get("reasoning_content") or msg.get("reasoning") or "")
         if msg.get("content"):
             st["wrote"] += 1
+            st.update(finish='done', error_code=None)
             yield msg["content"]
     except Exception as e:
         print(f"[llm] stream_answer fail (không stream): {e}")
         st["retry"] = True
+        st['error_code'] = 'timeout' if isinstance(e, (TimeoutError, httpx.TimeoutException)) else 'network'
 
 
 def _stream_once(cfg, body: dict, st: dict):
@@ -447,6 +453,7 @@ def _stream_once(cfg, body: dict, st: dict):
                     # trước đây không yield gì mà cũng không báo → /chat lặng lẽ echo ngữ cảnh (2026-11-04)
                     print(f"[llm] stream_answer HTTP {r.status_code}: {r.read()[:300].decode('utf-8', 'replace')}")
                     st["retry"] = r.status_code >= 500 or r.status_code == 429
+                    st['error_code'] = 'http_429' if r.status_code == 429 else 'http_5xx' if r.status_code >= 500 else 'http_4xx'
                     return
                 for line in r.iter_lines():
                     line = (line or "").strip()
@@ -454,6 +461,8 @@ def _stream_once(cfg, body: dict, st: dict):
                         continue
                     payload = line[5:].strip()
                     if payload == "[DONE]":
+                        if st['wrote']:
+                            st.update(finish='done', error_code=None)
                         break
                     try:
                         chunk = json.loads(payload)
@@ -465,6 +474,10 @@ def _stream_once(cfg, body: dict, st: dict):
                         if delta.get("content"):
                             st["wrote"] += 1
                             yield delta["content"]
+        if st['wrote'] and st['finish'] != 'done':
+            st.update(finish='truncated', error_code='network')
     except Exception as e:
         print(f"[llm] stream_answer fail: {e}")
         st["retry"] = True
+        st.update(finish='truncated' if st['wrote'] else 'error',
+                  error_code='timeout' if isinstance(e, (TimeoutError, httpx.TimeoutException)) else 'network')

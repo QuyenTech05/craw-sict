@@ -142,3 +142,26 @@ def test_rerank_uses_stored_cosine_without_embedding(monkeypatch):
     assert [h["url"] for h in out] == ["a", "b", "c"]                      # giữ thứ tự RRF
     assert out[1]["raw_score"] == 0.71 and abs(out[2]["raw_score"] - 0.6) < 1e-9
     assert asked == [("o", "p-bm25")] and "raw_score" not in out[0]
+
+
+def test_text_with_failed_image_keeps_text_and_does_not_cache(mm, monkeypatch):
+    monkeypatch.setattr(embedder, 'embed_query_image_base64', lambda _: (_ for _ in ()).throw(RuntimeError('offline')))
+    writes = []
+    monkeypatch.setattr(cache, 'put', lambda *a, **k: writes.append(a))
+    text, media, route = retriever.retrieve('học phí', 5, 'AAAA')
+    assert route.image_status == 'embedding_failed'
+    assert any(s.url == 'https://x/vn/hoc-phi' for s in text)
+    assert not writes
+
+
+def test_torch_image_failure_is_not_hidden_or_cached(mm, monkeypatch):
+    monkeypatch.setattr(get_settings().embedding, 'backend', 'torch')
+    monkeypatch.setattr(embedder, 'embed_query_image_base64', lambda _: (_ for _ in ()).throw(RuntimeError('offline')))
+    monkeypatch.setattr(embedder, 'embed_text_clip', lambda _: [TXT])
+    writes = []
+    monkeypatch.setattr(cache, 'put', lambda *a, **k: writes.append(a))
+    text, media, route = retriever.retrieve('học phí', 5, 'AAAA')
+    assert route.image_status == 'embedding_failed'
+    assert text and not writes
+    text, media, route = retriever.retrieve('', 5, 'AAAA')
+    assert not text and not media and route.image_status == 'embedding_failed'

@@ -84,7 +84,8 @@ async def add_query_ocr(q: QueryIn, result: dict) -> dict:
         ocr = {"status": "ok" if verified else "unverified", "text": text,
                "language": body.get("language"), "source_verified": verified}
         if verified:
-            return {**grounded, "ocr": ocr}
+            return {**grounded, "image_status": result.get("image_status", "none"),
+                    "inputs": result.get("inputs", ["image"]), "ocr": ocr}
         # Khi không có nguồn xác thực, vẫn cho phép đọc chữ từ ảnh, tách rõ
         # ngữ cảnh OCR khỏi trích dẫn SICT và không suy diễn ra nguồn khác.
         return {**result, "text": [], "media": [], "sufficient": False,

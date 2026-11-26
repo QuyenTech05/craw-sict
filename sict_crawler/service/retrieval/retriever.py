@@ -42,7 +42,7 @@ def query_cache_key(question: str, top_k: int, filters_key: str = "", index: str
     namespace = os.environ.get("SICT_EVAL_CACHE_NAMESPACE", "")
     if namespace:
         index = f"{index}|eval:{namespace}"
-    return "q:v13:" + hashlib.sha256(   # v13: route ảnh đầu vào và yêu cầu tệp; v12: media theo bằng chứng (ảnh của bài chữ đứng đầu, video, sufficient); v11: nhánh cụm tên riêng; v10: graph khái niệm D33 (bỏ [graph], ảnh theo người); v9: đoạn đủ dài, đoạn liền kề câu liệt kê, khôi phục dấu; v8: phạm vi mục + năm nhãn bảng + tiêu đề; v7: bảng mang nhãn; v6: D30
+    return "q:v14:" + hashlib.sha256(   # v14: không tái sử dụng cache trước khi ghi trạng thái ảnh
         f"{question}\x00{top_k}\x00{filters_key}\x00{index}".encode()).hexdigest()
 
 
@@ -523,8 +523,9 @@ def retrieve(question: str, top_k: int = 5,
         alt = [(rvec, r["rewritten"])]
     terms = list(dict.fromkeys(query_rewriter._terms(q0) + r["terms"])) if has_text else []
     ivec = ifut.result() if ifut is not None else None
-    if query_image_b64 and ivec is None and not has_text:
-        return [], [], router.Route(media="none", source="image", inputs=["image"])   # ảnh hỏng, không có chữ
+    route.image_status = ('ok' if ivec is not None else 'embedding_failed') if query_image_b64 else 'none'
+    if query_image_b64 and ivec is None and not question.strip():
+        return [], [], router.Route(media="none", source="image", inputs=["image"], image_status='embedding_failed')
     extra = [("i2t", ivec)] if ivec is not None else []
     # nhánh media không cần kết quả chữ để TÌM (chỉ cần khi chặn bằng router.gate) → chạy song song với nhánh chữ
     mfut = None
@@ -621,7 +622,7 @@ def retrieve(question: str, top_k: int = 5,
             _LOG.info("retrieval_plan_trace %s", json.dumps(retrieval_trace))
         except (TypeError, ValueError):
             pass
-    if route_override is None:
+    if route_override is None and route.image_status != 'embedding_failed':
         cache.put(ck, json.dumps({
             "text": [s.model_dump() for s in tsrcs],
             "media": [s.model_dump() for s in msrcs],

@@ -35,7 +35,7 @@ def test_collect_sends_real_image_to_query_and_chat_without_saving_base64(tmp_pa
     def fake_post(api, path, body, timeout):
         calls.append((path, body))
         if path == "/query":
-            return io.BytesIO(json.dumps({"context": "Nguồn A", "text": [], "media": []}).encode())
+            return io.BytesIO(json.dumps({"context": "Nguồn A", "text": [], "media": [], "image_status": "ok"}).encode())
         return io.BytesIO(b'data: {"delta": "Tra loi tu anh"}\n\ndata: [DONE]\n\n')
 
     monkeypatch.setattr(ragas, "post", fake_post)

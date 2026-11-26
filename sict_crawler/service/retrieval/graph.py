@@ -159,10 +159,15 @@ def _answer_events(question: str, image: str | None, result: dict):
     from sict_crawler.service.retrieval import citations, vlm
     text, media, context = result['text'], result['media'], result['context']
     status_fields = ('attempts', 'sufficient', 'media_mode', 'wants_file', 'media_note',
-                     'list_question', 'entities', 'inputs', 'outputs', 'ocr')
+                     'list_question', 'entities', 'inputs', 'outputs', 'ocr', 'image_status')
     yield {'status': {key: result.get(key) for key in status_fields}}
     yield {'text': [source.model_dump(exclude={'content'}) for source in text],
            'media': [source.model_dump(exclude={'content'}) for source in media]}
+    if image and not question.strip() and result.get('image_status') == 'embedding_failed' and not (result.get('ocr') or {}).get('text'):
+        yield {'delta': 'Không xử lý được ảnh đính kèm (dịch vụ embedding lỗi). Vui lòng thử lại.'}
+        yield {'citations': []}
+        yield {'done': True}
+        return
     if result.get('oos'):
         yield {'delta': 'Câu hỏi nằm ngoài phạm vi thông tin của SICT.'}
         yield {'citations': []}
@@ -174,8 +179,9 @@ def _answer_events(question: str, image: str | None, result: dict):
     # T2 prompt cache: hit → stream lại từ cache, không gọi LLM (spec docs/prompt_caching_multi_tier.md).
     from sict_crawler.service.retrieval.prompt_cache import stream_answer_cached
     pieces = []
+    generation = {}
     try:
-        for chunk in stream_answer_cached(prompt, context, image):
+        for chunk in stream_answer_cached(prompt, context, image, state=generation):
             pieces.append(chunk)
             yield {'delta': chunk}
     except Exception:
@@ -191,6 +197,8 @@ def _answer_events(question: str, image: str | None, result: dict):
     if final != said:
         yield {'delta': final[len(said):]} if final.startswith(said) else {'answer': final}
     yield {'citations': cites}
+    if generation.get('finish') != 'done':
+        yield {'status': {'generation': 'incomplete', 'error_code': generation.get('error_code', 'empty')}}
     yield {'done': True}
 
 
